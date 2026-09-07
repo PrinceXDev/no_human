@@ -635,10 +635,23 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "same gate's documented FIX for a tree with no classification "
             "ledger to consult, also inside the task worktree (120s "
             "timeout); the committed script re-hashes every tracked file "
-            "from `git ls-files` + working-tree bytes and dials nothing",
-            _ON + "the pipeline commit path — proactively on every commit, "
-            "reactively on exactly the manifest gate's changed-pinned-files "
-            "refusal (commit_with_manifest_repair, approve_pending_pins)"),
+            "from `git ls-files` + working-tree bytes and dials nothing — "
+            "and now also PROACTIVELY, before every commit attempt on that "
+            "same PUBLIC shape (`write_pending_manifest`, same script/args/"
+            "timeout): when the caller names paths, it stages them first "
+            "(new files included, plus a non-code sibling deliverable in a "
+            "directory that same commit is newly creating) so a brand-new "
+            "untracked file is pinned in the commit that adds it rather "
+            "than shipping unlisted (task 2d30b000; both gaps closed after "
+            "independent review, 2026-09-07); when the caller names no "
+            "paths at all (a Bash-only coder), it stages the whole tree "
+            "instead before the same `--write`; a failing or hanging "
+            "proactive run is log-only and falls through to the REACTIVE "
+            "route above as fallback",
+            _ON + "the pipeline commit path — proactively on every commit "
+            "(both repo shapes now), reactively on exactly the manifest "
+            "gate's changed-pinned-files refusal (commit_with_manifest_repair, "
+            "approve_pending_pins, write_pending_manifest)"),
     },
     "vcs/github.py": {
         "exec:gh": Allowed("your GitHub host — PR create/read",
