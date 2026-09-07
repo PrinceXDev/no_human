@@ -6,6 +6,60 @@ All notable changes to no_human. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-07
+
+Fixes for the first Windows users of the setup wizard, and for no_human's own
+pipeline committing on this public repository.
+
+### Fixed
+- **Setup wizard, "Search another folder": typing a folder now completes on
+  every platform.** Typing an existing folder without a trailing slash made
+  `/api/fs/suggest` list that folder's children while the board built each
+  option over the folder itself (`~/work` + `svc` became `~/svc`), so the
+  native datalist never matched and no completion appeared. The server now
+  returns `prefix` (empty when it listed the typed folder's children) and
+  `optionValue` appends instead of splicing. Windows paths complete too:
+  the option prefix is cut at the last separator of either kind, so
+  `C:\Users\me\Doc` offers `C:\Users\me\Documents`.
+- **Repo auto-scan looks where Windows and Linux developers clone.**
+  `source` (Visual Studio's `~/source/repos`) is a conventional root on every
+  platform; off macOS, `Desktop` and `Documents` are scanned as roots at depth
+  2 (GitHub Desktop's `~/Documents/GitHub`), and the home-level skip list is
+  only `Library` there. macOS is unchanged apart from `~/source` (its
+  Desktop/Documents/Downloads skip exists to avoid the TCC prompt). The home
+  folder is walked before every other root, so a wide `~/Documents` can no
+  longer push a repo cloned straight under `~` past the result ceiling.
+- **A typed folder that does not exist says so** ("… does not exist or is not
+  a folder.") instead of "no git repositories there". A bare Windows drive
+  (`D:`) means the drive root rather than the process's current directory on
+  that drive, `~\x` expands like `~/x`, and a trailing backslash means "list
+  inside" on Windows only. Repo names on the board are derived on either
+  separator, and the folder-search hint states the macOS-only skip truthfully.
+- **Every install is no longer flagged as a PostHog internal user.** posthog-js
+  2026-05-30 defaults mark any person on localhost/127.0.0.1 as
+  `$internal_or_test_user`; the board always serves on 127.0.0.1, so every real
+  install was hidden behind PostHog's internal-user filter. The board now
+  passes `internal_or_test_user_hostname: null`.
+- **no_human's own commits on this repository.** The manifest pre-commit gate
+  refused every pipeline commit that changed a pinned file, because the repair
+  only knew the private tree's `export_guard.py`; `manifest_repair.py` now runs
+  `scripts/check_release_manifest.py --write` and retries once with
+  `RELEASE_MANIFEST.txt` in the commit. Files a coder ADDED shipped with no
+  manifest row (`--write` reads `git ls-files`, and the gate ignores unpinned
+  paths), failing CI's strict inventory; the pipeline now stages the commit's
+  paths (new files and the non-code deliverables in a directory the commit
+  creates) before `--write`, and stages the whole tree when the coder edited
+  outside the editor tool.
+- **Merge policy no longer reports "ready" while a required GitHub check is
+  red.** A delivered PR's check rollup is stamped into `task.context.ci_status`
+  when the task enters awaiting_approval, and the ci detail names the failing
+  checks.
+- The agent's bash guard treats a Windows volume or share root (`C:\`, `C:/`,
+  `\\server\share`) as a filesystem-wide scan target, and strips `.exe` when
+  matching installer names (public #116, #117, by @Sreekant13). The bundled-CLI
+  check asserts the directory and stem rather than the POSIX name (#102).
+  `nh test --help` describes the mode selectors (#103, by @ShamikOfficial).
+
 ### Changed
 - **The MCP bridge runs on the MCP SDK 2.x API, and the requirement is now
   `mcp>=2,<3`.** `intake/mcp_bridge.py` imports `mcp.server.mcpserver.MCPServer`
@@ -19,7 +73,6 @@ All notable changes to no_human. The format follows
   (`uvx --with "mcp<2" no-human mcp-serve`), drop the `--with`: it now
   conflicts with the declared bound. First contribution by @Siddh2024
   (public issue #16).
-
 ## [0.2.0] — 2026-09-05
 
 First release developed entirely in the open on the public repository, including
