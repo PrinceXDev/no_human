@@ -118,9 +118,13 @@ FROZEN_FUNCTION_LINES = {
     # `landed = await self._land_no_changes_needed(...); if landed is not
     # None: return landed`. The delegation costs lines in the new helper
     # (see the file-total entry below) but nets `_run_attempt` itself
-    # smaller than even the pre-incident-fix baseline. Measured on this
-    # tree with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2214,
+    # smaller than even the pre-incident-fix baseline.
+    # 2214 -> 2164: re-frozen at the measured value on this tree after the
+    # red-run failure-blocks fix (task 3bccb499). The old 2214 carried 63
+    # lines of slack over main's measured 2151; the fix itself is +13 lines
+    # here (2151 -> 2164) — the CAP shrank, the function did not. Measured
+    # on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2164,
     # 760 -> 778 (+18): dispatch-time intake-eval hoisted path — the `elif
     # ctx.get("eval_result")` branch that acts on a grill/wizard-stored
     # verdict (idempotency marker, cost/residual-gap comments) added inside
@@ -281,9 +285,12 @@ FROZEN_FUNCTION_CC = {
     # 264 -> 258 (-6): the review fix delegates both guards, plus the
     # validated status-transition branching, into `_land_no_changes_needed`
     # — `_run_attempt`'s own zero-diff site is now just the delegating call
-    # plus its `if landed is not None:` check. Measured on this tree with
-    # the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 258,
+    # plus its `if landed is not None:` check.
+    # 258 -> 235: re-frozen at the measured value on this tree after the
+    # red-run failure-blocks fix (task 3bccb499). Main measures 232 and the
+    # fix is +3 CC (the old 258 was 26 CC of slack). Measured on this tree
+    # with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 235,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -768,7 +775,25 @@ FROZEN_FILE_LINES = {
     # repo.head_sha())`, so the net line count lands back at 22585 — same
     # number as the flag, different (correct, flagless) mechanism. Measured
     # on this tree by the scanner's own metric.
-    "core/orchestrator.py": 22585,
+    # 22585 -> 22691 (+106): a red test run's `tests` event now carries its
+    # FAILING blocks (`_red_test_detail`, `_test_output_artifact_path`,
+    # `_write_test_output_artifact` next to `_verification_artifact_path`)
+    # instead of the last 1200 bytes of the stream, and the full runner
+    # output is written to an attempt-scoped `tests-attempt-<n>.log`
+    # artifact. Measured on this tree by the scanner's own metric.
+    # 22691 -> 22703 (+12): `_failed_tests_outcome` gained a `blocks`
+    # parameter so its owned-failure and flaky-excused `update_attempt`
+    # calls carry `failure_blocks` too — those calls REPLACE the
+    # `test_results` column rather than merge it, so without this the
+    # blocks the plain branch had just written were dropped the moment a
+    # red run got attributed and billed.
+    # 22703 -> 22699 (-4): net of the round-3 dict-passthrough refactor of
+    # `_layered_tests_failed_outcome` (-5), the round-4 render/persist
+    # parity fix (+3) and the landing's wiring of `_red_test_detail` onto
+    # `runner.render_failure_blocks` instead of its own copy of the join
+    # (-2). Main measures 22585, so the whole fix is +114 lines on this
+    # file. Measured on this tree by the scanner's own metric.
+    "core/orchestrator.py": 22699,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

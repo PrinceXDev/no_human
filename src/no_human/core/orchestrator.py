@@ -6477,8 +6477,16 @@ class Orchestrator:
                 if lr.result
                 for name in (getattr(lr.result, "failing_tests", []) or [])
             ]
-            self.emit("tests", plan_result.summary, ok=plan_result.ok,
-                       failing_tests=failing_tests)
+            layer_results = [
+                lr.result for lr in plan_result.layer_results if lr.result is not None
+            ]
+            text, blocks, blocks_dropped, artifact_path = ("", [], 0, "")
+            if not plan_result.ok:
+                text, blocks, blocks_dropped, artifact_path = self._red_test_detail(
+                    task, layer_results, attempt_n=attempt_seq)
+            self.emit("tests", plan_result.summary + (f"\n{text}" if text else ""),
+                       ok=plan_result.ok, failing_tests=failing_tests,
+                       tests_log=artifact_path)
             # Build aggregate test_results for the attempt record.
             total_passed = sum(
                 (lr.result.passed if lr.result else 0) for lr in plan_result.layer_results
@@ -6490,15 +6498,19 @@ class Orchestrator:
                 (lr.result.errors if lr.result else 0) for lr in plan_result.layer_results
             )
             any_ran = any(lr.result and lr.result.ran for lr in plan_result.layer_results)
+            # Named so it is PASSED THROUGH to `_layered_tests_failed_outcome`
+            # below, not rebuilt there (round-3 review: a second copy drifted).
+            layer_test_results = {
+                "ran": any_ran, "ok": plan_result.ok,
+                "passed": total_passed, "failed": total_failed,
+                "errors": total_errors, "tamper_flag": False,
+                "layers": [lr.summary for lr in plan_result.layer_results],
+                "failing_tests": failing_tests,
+                "failure_blocks": blocks,
+                "failure_blocks_dropped": blocks_dropped,
+            }
             await self.store.update_attempt(
-                attempt_id,
-                test_results={
-                    "ran": any_ran, "ok": plan_result.ok,
-                    "passed": total_passed, "failed": total_failed,
-                    "errors": total_errors, "tamper_flag": False,
-                    "layers": [lr.summary for lr in plan_result.layer_results],
-                    "failing_tests": failing_tests,
-                },
+                attempt_id, test_results=layer_test_results,
             )
             if any_ran and not plan_result.ok:
                 # Extracted to `_layered_tests_failed_outcome` (structural
@@ -6508,9 +6520,8 @@ class Orchestrator:
                 # terminal, either via the environment classifier or the
                 # billing path at the bottom of that method.
                 return await self._layered_tests_failed_outcome(
-                    task, plan_result=plan_result,
-                    total_passed=total_passed, total_failed=total_failed,
-                    total_errors=total_errors, failing_tests=failing_tests,
+                    task, plan_result=plan_result, test_results=layer_test_results,
+                    failing_tests=failing_tests,
                     attempt_id=attempt_id, repo=repo, branch=branch, base=base,
                     test_cwd=test_cwd, commit=commit, result=result, stuck=stuck,
                 )
@@ -6519,12 +6530,17 @@ class Orchestrator:
             # agent phases keep progressing on the event loop (Phase 7). The
             # reviewer already ran this exact command against this exact commit.
             test_result, was_cached = await self._run_tests_once(repo, test_cmd, cwd=test_cwd)
-            # On failure the event carries the output tail — "FAIL: 0 passed,
-            # 0 failed, 1 errors" with NO detail cost the 2026-07-11 triage an
-            # hour of reproduction (the record must name the failing thing).
-            fail_tail = ""
+            # On failure the event carries the failing blocks (node TAP `not
+            # ok` blocks / pytest FAILED sections), not the bare output tail —
+            # "FAIL: 0 passed, 0 failed, 1 errors" with NO detail cost the
+            # 2026-07-11 triage an hour of reproduction, and a later incident
+            # (2026-09-08) showed the [-1200:] tail itself was USELESS on a
+            # large suite: the failing blocks sit thousands of bytes before
+            # it. See `_red_test_detail`.
+            text, blocks, blocks_dropped, artifact_path = ("", [], 0, "")
             if not test_result.ok:
-                fail_tail = (getattr(test_result, "output", "") or "")[-1200:]
+                text, blocks, blocks_dropped, artifact_path = self._red_test_detail(
+                    task, [test_result], attempt_n=attempt_seq)
             failing_tests = getattr(test_result, "failing_tests", []) or []
             # A run that found no command says so in the event too: the board
             # reads this line, and "no test command detected" with ok=True is
@@ -6536,18 +6552,30 @@ class Orchestrator:
                 "tests",
                 not_run + test_result.summary
                 + (" (reused the reviewer's run)" if was_cached else "")
-                + (f"\n{fail_tail}" if fail_tail else ""),
+                + (f"\n{text}" if text else ""),
                 ok=test_result.ok, cached=was_cached, failing_tests=failing_tests,
-                ran=test_result.ran,
+                ran=test_result.ran, tests_log=artifact_path,
             )
+            # Built ONCE and reused (spread + override) at every later
+            # `update_attempt(..., test_results=...)` call this red run can
+            # reach below — `update_attempt` REPLACES the whole column
+            # (never merges it, see the comment further down), so any site
+            # that built its own dict from scratch instead of this one could
+            # silently drop `failure_blocks` from the persisted record
+            # (round-2 review MAJOR: exactly the incident this file exists
+            # to prevent, one level deeper than the billing-path sites
+            # already fixed).
+            base_test_results = {
+                "ran": test_result.ran, "ok": test_result.ok,
+                "passed": test_result.passed, "failed": test_result.failed,
+                "errors": test_result.errors, "tamper_flag": False,
+                "failing_tests": failing_tests,
+                "failure_blocks": blocks,
+                "failure_blocks_dropped": blocks_dropped,
+            }
             await self.store.update_attempt(
                 attempt_id,
-                test_results={
-                    "ran": test_result.ran, "ok": test_result.ok,
-                    "passed": test_result.passed, "failed": test_result.failed,
-                    "errors": test_result.errors, "tamper_flag": False,
-                    "failing_tests": failing_tests,
-                },
+                test_results=base_test_results,
             )
             if test_result.ran and not test_result.ok:
                 # Ownership (cheap: a git-diff lookup, no test re-run) is
@@ -6579,12 +6607,7 @@ class Orchestrator:
                 env_outcome = await self._environment_test_failure(
                     task, result=test_result, attempt_id=attempt_id,
                     repo=repo, branch=branch,
-                    test_results={
-                        "ran": test_result.ran, "ok": test_result.ok,
-                        "passed": test_result.passed, "failed": test_result.failed,
-                        "errors": test_result.errors, "tamper_flag": False,
-                        "failing_tests": failing_tests,
-                    },
+                    test_results=base_test_results,
                     owned_failing=owned,
                 )
                 if env_outcome is not None:
@@ -6618,12 +6641,8 @@ class Orchestrator:
                         await self.store.update_attempt(
                             attempt_id, status="failed", failure_reason=detail,
                             test_results={
-                                "ran": test_result.ran, "ok": False,
-                                "passed": test_result.passed,
-                                "failed": test_result.failed,
-                                "errors": test_result.errors,
-                                "tamper_flag": False,
-                                "failing_tests": failing_tests,
+                                **base_test_results,
+                                "ok": False,
                                 "invocation_error": True,
                             },
                         )
@@ -6650,11 +6669,8 @@ class Orchestrator:
                         await self.store.update_attempt(
                             attempt_id, status="failed", failure_reason=detail,
                             test_results={
-                                "ran": test_result.ran, "ok": False,
-                                "passed": test_result.passed,
-                                "failed": test_result.failed,
-                                "errors": test_result.errors,
-                                "tamper_flag": False,
+                                **base_test_results,
+                                "ok": False,
                                 "invocation_error": True,
                                 "reproduces_on_base": False,
                             },
@@ -6673,22 +6689,15 @@ class Orchestrator:
                     )
                     await self.store.update_attempt(
                         attempt_id,
+                        # `update_attempt` REPLACES the `test_results` column
+                        # (db.py: `test_results = :test_results`), it does not
+                        # merge — so this write must carry every field the
+                        # earlier write held (`failing_tests`, `failure_
+                        # blocks`) or it silently drops them. `base_test_
+                        # results` is that one shared dict, built once above.
                         test_results={
-                            "ran": test_result.ran, "ok": False,
-                            "passed": test_result.passed, "failed": test_result.failed,
-                            "errors": test_result.errors, "tamper_flag": False,
-                            # 🔴 CARRY THE NAMES. `update_attempt` REPLACES the
-                            # `test_results` column (db.py: `test_results =
-                            # :test_results`), it does not merge — so this dict
-                            # overwrote the one written above, which was the only
-                            # one holding `failing_tests`. The PR body's
-                            # "- failing tests:" block was therefore unreachable
-                            # on the one path that actually reaches it: a partial
-                            # run whose counts are real and whose invocation also
-                            # stumbled. Rendering a name list nothing can populate
-                            # is the same dead code as the `or counted` clause
-                            # deleted from `_test_evidence_section`.
-                            "failing_tests": failing_tests,
+                            **base_test_results,
+                            "ok": False,
                             "invocation_error": True,
                             "reproduces_on_base": on_base,
                         },
@@ -6722,22 +6731,25 @@ class Orchestrator:
                     # we could not attribute. An owned id blocks this excuse too:
                     # a test the attempt itself modified is never pre-existing.
                     if newly_failing == [] and not owned:
+                        # A red run excused as pre-existing must still say
+                        # WHAT was red — `text`/`blocks`/`artifact_path` were
+                        # already computed above (this IS the same
+                        # `test_result`) by `_red_test_detail`; reused here
+                        # rather than recomputed so the artifact is written
+                        # exactly once per attempt.
                         note = (
                             "tests failed, but every failing test already fails "
                             "on the base tree — pre-existing, not introduced by "
                             "this change: " + ", ".join(failing_tests)
+                            + (f"\n{text}" if text else "")
                         )
                         self.emit("tests", note, ok=True,
-                                  failing_tests=failing_tests, pre_existing=True)
+                                  failing_tests=failing_tests, pre_existing=True,
+                                  tests_log=artifact_path)
                         await self.store.update_attempt(
                             attempt_id,
                             test_results={
-                                "ran": test_result.ran, "ok": test_result.ok,
-                                "passed": test_result.passed,
-                                "failed": test_result.failed,
-                                "errors": test_result.errors,
-                                "tamper_flag": False,
-                                "failing_tests": failing_tests,
+                                **base_test_results,
                                 "pre_existing_failures": failing_tests,
                             },
                         )
@@ -6755,7 +6767,8 @@ class Orchestrator:
                             failing_tests=failing_tests, attempt_id=attempt_id,
                             repo=repo, branch=branch, test_cmd=test_cmd,
                             test_cwd=test_cwd, commit=commit, result=result,
-                            stuck=stuck,
+                            stuck=stuck, blocks=blocks,
+                            blocks_dropped=blocks_dropped,
                         )
                         if outcome is not None:
                             return outcome
@@ -12112,21 +12125,20 @@ class Orchestrator:
         return list(attributed)
 
     async def _layered_tests_failed_outcome(
-        self, task: Task, *, plan_result, total_passed: int, total_failed: int,
-        total_errors: int, failing_tests: list[str], attempt_id: str,
+        self, task: Task, *, plan_result, test_results: dict,
+        failing_tests: list[str], attempt_id: str,
         repo: GitRepo | None, branch: str | None, base: str | None,
         test_cwd: "Path | None", commit, result, stuck: StuckDetector,
     ) -> TaskOutcome:
         """The layered-test-plan branch of `_run_attempt`, once a BLOCKING
-        layer has failed. Extracted from `_run_attempt` (structural budget:
-        it is capped at a frozen line/CC count — see
-        `tests/test_structural_budget.py`) — NOT verbatim: this body also
-        carries the ~19 lines of ownership/environment-classification logic
-        (the `owned` computation below and the `_environment_test_failure`
-        call it feeds) that a pure code-move would not have added. Always
-        returns a TaskOutcome — entering this branch is itself already
-        terminal, either via the environment classifier below or the
-        billing path at the end.
+        layer has failed (structural budget: extracted to keep `_run_attempt`
+        under its frozen line/CC cap — `tests/test_structural_budget.py`).
+        Always returns a TaskOutcome.
+
+        `test_results` is the SAME dict the caller already built and
+        persisted (`_run_attempt`'s `layer_test_results`) — passed through,
+        not rebuilt, since a second independently-built copy here previously
+        drifted from it (round-3 review MAJOR-2: missing `failure_blocks`).
         """
         from ..testing.test_layers import Gating as _Gating
 
@@ -12158,13 +12170,7 @@ class Orchestrator:
         env_outcome = await self._environment_test_failure(
             task, result=fail_result, attempt_id=attempt_id,
             repo=repo, branch=branch,
-            test_results={
-                "ran": True, "ok": plan_result.ok,
-                "passed": total_passed, "failed": total_failed,
-                "errors": total_errors, "tamper_flag": False,
-                "layers": [lr.summary for lr in plan_result.layer_results],
-                "failing_tests": failing_tests,
-            },
+            test_results=test_results,
             owned_failing=owned,
         )
         if env_outcome is not None:
@@ -12207,6 +12213,7 @@ class Orchestrator:
         owned: list[str], failing_tests: list[str], attempt_id: str,
         repo: GitRepo | None, branch: str | None, test_cmd: str | None,
         test_cwd: "Path | None", commit, result, stuck: StuckDetector,
+        blocks: list[str] | None = None, blocks_dropped: int = 0,
     ) -> TaskOutcome | None:
         """The single-run test-failure attribution + billing branch of
         `_run_attempt`, reached once a red run is not excused as pre-existing
@@ -12214,10 +12221,21 @@ class Orchestrator:
         Extracted verbatim (structural budget: see
         `tests/test_structural_budget.py`).
 
+        `blocks` / `blocks_dropped`: the BOUNDED failure blocks (and their
+        true drop count) `_red_test_detail` already computed for this
+        `test_result` at the call site. Every
+        `update_attempt(..., test_results=...)` call below REPLACES the
+        whole column (see the comment at the pre-existing-excuse write
+        above) rather than merging it, so each one must carry
+        `failure_blocks`/`failure_blocks_dropped` itself or it silently
+        drops the blocks the plain branch just wrote — the incident this
+        file exists to prevent.
+
         Returns None when the flaky-excuse path fires — nothing to bill, and
         the caller must fall through exactly as it always did; a real billing
         decision returns a TaskOutcome.
         """
+        blocks = blocks or []
         # Name the NEWLY-failing ids when the base check isolated
         # them (mixed run); otherwise (None → inconclusive/
         # fail-closed) fall back to all failing ids, byte-for-byte
@@ -12268,6 +12286,8 @@ class Orchestrator:
                     "tamper_flag": False,
                     "failing_tests": failing_tests,
                     "flaky_excused": flaky,
+                    "failure_blocks": blocks,
+                    "failure_blocks_dropped": blocks_dropped,
                 },
             )
             return None
@@ -12331,6 +12351,8 @@ class Orchestrator:
                     "tamper_flag": False,
                     "failing_tests": failing_tests,
                     "owned_failures": owned_attr,
+                    "failure_blocks": blocks,
+                    "failure_blocks_dropped": blocks_dropped,
                 },
             )
         else:
@@ -22117,6 +22139,98 @@ SIX of them read a checkpoint and TWO do not — but do
         except Exception as exc:  # noqa: BLE001 — advisory only
             self._advisory(f"verification artifact not written: {exc}")
             return ""
+
+    @staticmethod
+    def _test_output_artifact_path(
+        task_id: str, attempt_n: int | str | None,
+    ) -> Path:
+        """Where THIS attempt's FULL runner output (every `TestRunResult` the
+        run produced, untruncated) is written — same root/attempt-scoping
+        contract as `_verification_artifact_path` (attempt-scoped filename,
+        ``"unknown"`` fallback for a ``None``/empty `attempt_n`, never created here),
+        a sibling file next to that attempt's `verification-attempt-<n>.md`.
+
+        Exists because the incident this whole change fixes was a red run
+        whose failing block sat thousands of bytes before the `[-1200:]`
+        tail the `tests` event carried — the event/`test_results` render a
+        BOUNDED summary of the failure (`_red_test_detail`), and this file is
+        where the operator goes for the rest.
+        """
+        n = attempt_n if attempt_n not in (None, "") else "unknown"
+        return (NO_HUMAN_HOME / Orchestrator._ARTIFACTS_DIRNAME / task_id
+                / f"tests-attempt-{n}.log")
+
+    def _write_test_output_artifact(
+        self, task: Task, results: list, *, attempt_n: int | str | None,
+    ) -> str:
+        """Write every result in *results* (a run's `TestRunResult`s — one
+        for the plain branch, one per test-plan layer for the layered
+        branch) FULL untruncated output to this attempt's own artifact file
+        and return the ABSOLUTE path — modelled line-for-line on
+        `_write_verification_artifact`, same best-effort contract (a write
+        failure is advisory and must never cost the PR).
+
+        Returns "" WITHOUT writing anything when every result is ok (a green
+        run never gets a log file — the whole point is red-run evidence) or
+        when *results* is empty.
+        """
+        if not results or all(getattr(r, "ok", True) for r in results):
+            return ""
+        try:
+            path = self._test_output_artifact_path(task.id, attempt_n)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = "\n\n".join(
+                getattr(r, "full_output", "") or getattr(r, "output", "") or ""
+                for r in results
+            )
+            path.write_text(content, encoding="utf-8")
+            return str(path)
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            self._advisory(f"test output artifact not written: {exc}")
+            return ""
+
+    def _red_test_detail(
+        self, task: Task, results: list, *, attempt_n: int | str | None,
+    ) -> tuple[str, list[str], int, str]:
+        """The ONE seam every red-run call site (the layered branch, the
+        plain `_run_tests_once` branch, and the base-tree pre-existing
+        recheck) uses to turn *results* into
+        ``(text, kept_blocks, dropped_count, artifact_path)``:
+
+        - ``kept_blocks`` / ``dropped_count``: ``runner.bound_failure_blocks``
+          over the FULL concatenation of ``runner.failure_report_blocks`` per
+          result (node TAP `not ok` blocks / pytest FAILED sections — never
+          re-parsed here, see that function) — the SAME bounded walk that
+          produces ``text``, so the persisted `test_results["failure_blocks"]`
+          a caller stores from ``kept_blocks`` always matches what the event
+          text (and the evidence ledger, which renders that same column)
+          actually shows. Persisting the full unbounded concatenation instead
+          (round-3 review MAJOR) let a 435-failure run write 672KB into one
+          `attempts.test_results` column while the text said "... 428 more".
+        - ``text``: joins ``kept_blocks`` with an explicit
+          ``... N more failing blocks`` line when ``dropped_count`` is
+          nonzero, then a pointer line naming the full-log artifact. When
+          no blocks were parsed at all (an invocation error with no `not ok`
+          line — the base-tree-gate node-missing-deps shape), falls back to
+          the last result's ``output[-1200:]`` tail — the same text the
+          pre-fix code emitted (the event now also names the full-log
+          artifact) — so a run with nothing else to say keeps saying it.
+        - ``artifact_path``: the absolute path `_write_test_output_artifact`
+          wrote (or "" — advisory, never blocks the caller).
+        """
+        blocks: list[str] = []
+        for result in results:
+            blocks.extend(runner.failure_report_blocks(result))
+        kept_blocks, dropped = runner.bound_failure_blocks(blocks)
+        text = runner.render_failure_blocks(blocks)
+        if not text and results:
+            text = (getattr(results[-1], "output", "") or "")[-1200:]
+        artifact_path = self._write_test_output_artifact(
+            task, results, attempt_n=attempt_n)
+        if artifact_path:
+            pointer = f"full test output: {self._display_path(artifact_path)}"
+            text = f"{text}\n{pointer}" if text else pointer
+        return text, kept_blocks, dropped, artifact_path
 
     @staticmethod
     def _verification_section(
