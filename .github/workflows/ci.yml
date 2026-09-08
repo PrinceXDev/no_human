@@ -502,10 +502,17 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
-      # --ignore-scripts skips Electron's postinstall, which fetches a ~100 MB
-      # platform binary. The suite does not need it: Electron is stubbed
-      # through desktop/testing/electronLoader.mjs.
-      - run: npm ci --ignore-scripts
+      # A plain `npm ci` runs this package's postinstall (Electron's own
+      # installer, ~120 MB download, ~300 MB extracted) BEFORE the suite.
+      # Skipping it with --ignore-scripts does not avoid the download: the
+      # stubbed suite still reaches node_modules/electron/index.js through
+      # electron-updater's CJS require("electron") (testing/updaterLoader.mjs)
+      # and fetches the binary inside the concurrent run, where the stubbed
+      # boot tests' fixed settle windows (a 20 s poll in mainSaveFailure, a
+      # 5 s sleep in mainLateServer) can expire (measured 2026-09-08: a cold
+      # `--ignore-scripts` run failed those two files). Installing first
+      # makes the run deterministic.
+      - run: npm ci
 
       # Icons are build OUTPUTS (untracked); packagedFiles.test.mjs checks the
       # .ico bytes on every platform, so derive them first. The .ico and .png
@@ -517,7 +524,7 @@ jobs:
       # `npm test` is `node --test .`, which Node 22 rejects, so the files are
       # listed explicitly. uiPages.test.mjs is the one suite that does need the
       # real Electron binary: it spawns a renderer to read computed styles.
-      # Run it locally with a full `npm ci`.
+      # Run it locally after the same `npm ci`.
       - name: Run tests
         run: |
           files=()
@@ -633,12 +640,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The same file list as the ubuntu desktop job, for the same reason:
-      # uiPages.test.mjs is the one suite that needs the real Electron binary,
-      # and `npm ci --ignore-scripts` skips the ~100 MB download that would
-      # fetch it.
+      # uiPages.test.mjs is the one suite that spawns the real Electron
+      # binary. The plain `npm ci` fetches that binary in the postinstall,
+      # before the suite, instead of inside it (see the ubuntu job's note).
       - name: Install the desktop shell's dependencies
         working-directory: desktop
-        run: npm ci --ignore-scripts
+        run: npm ci
 
       # Same reason as the ubuntu desktop job: icons are untracked build
       # outputs and the .ico byte checks need one. Windows derives the .ico
@@ -705,8 +712,8 @@ jobs:
       # ONLY on a workflow_dispatch that set windows_release=true — a bundle
       # built from a random main push must not sit on the public repo as a
       # downloadable artefact (same refusal as the linux job's comment). The
-      # full `npm ci` (scripts on) replaces the --ignore-scripts install above
-      # because electron-builder needs the real Electron binary to package.
+      # `npm ci` here repeats the install above (both now run the postinstall
+      # that fetches the real Electron binary electron-builder packages).
       - name: Install the desktop shell's dependencies WITH scripts (release build only)
         if: github.event_name == 'workflow_dispatch' && inputs.windows_release
         working-directory: desktop
