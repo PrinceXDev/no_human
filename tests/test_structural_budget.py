@@ -124,7 +124,10 @@ FROZEN_FUNCTION_LINES = {
     # lines of slack over main's measured 2151; the fix itself is +13 lines
     # here (2151 -> 2164) — the CAP shrank, the function did not. Measured
     # on this tree with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2164,
+    # 2164 -> 2192 (+28): the background-run report nudge's call site in
+    # `_run_attempt`'s committed-diff path (task 7a7713e3, landed on top of
+    # 3bccb499's 2164). Measured on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2192,
     # 760 -> 778 (+18): dispatch-time intake-eval hoisted path — the `elif
     # ctx.get("eval_result")` branch that acts on a grill/wizard-stored
     # verdict (idempotency marker, cost/residual-gap comments) added inside
@@ -290,7 +293,10 @@ FROZEN_FUNCTION_CC = {
     # red-run failure-blocks fix (task 3bccb499). Main measures 232 and the
     # fix is +3 CC (the old 258 was 26 CC of slack). Measured on this tree
     # with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 235,
+    # 235 -> 240 (+5): the report-nudge call site's try/except and its
+    # once-guard in `_run_attempt` (task 7a7713e3, landed on top of 3bccb499's
+    # 235). Measured on this tree with the scanner below.
+    "core/orchestrator.py:Orchestrator._run_attempt": 240,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -793,7 +799,13 @@ FROZEN_FILE_LINES = {
     # `runner.render_failure_blocks` instead of its own copy of the join
     # (-2). Main measures 22585, so the whole fix is +114 lines on this
     # file. Measured on this tree by the scanner's own metric.
-    "core/orchestrator.py": 22699,
+    # 22699 -> 22952 (+253): the background-run report nudge (task
+    # 7a7713e3: `_REPORT_NUDGE*` constants, `_looks_like_background_wait`,
+    # `Orchestrator._report_nudge`, its call site in `_run_attempt`, the
+    # `_abort_during_nudge` docstring sentence and the guard-set pop in
+    # `_begin_attempt_accounting`), landed on top of 3bccb499's 22699.
+    # Measured on this tree by the scanner's own metric.
+    "core/orchestrator.py": 22952,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

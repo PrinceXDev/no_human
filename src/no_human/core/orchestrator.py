@@ -999,6 +999,70 @@ _REFORMAT_NUDGE = (
 #: — shortening the attempt ceiling shortens this too.
 _NUDGE_TIMEOUT_S = 120.0
 
+#: The substring that identifies the report follow-up in a prompt log — the
+#: same convention as `_REFORMAT_NUDGE_MARKER`, so `backend.prompts` /
+#: `backend.nudges` filtering works the same way for both.
+_REPORT_NUDGE_MARKER = "there is no notification and no wake-up"
+
+#: `max_turns=1` below is one assistant response — not enough to start a
+#: background verification run AND poll it to completion AND write a report.
+#: An earlier draft of this nudge asked for exactly that and, measured
+#: against the real backend, that turn ends as an error (`error_max_turns`)
+#: whenever the coder actually tries it — which is the shape
+#: `_report_nudge`'s `is_error`/stop-reason guard below exists to catch, not
+#: something this prompt should invite. It also cannot generally "read the
+#: background run's log": that process was a subprocess of the CODER turn,
+#: which has already exited, and its output only survives if it was
+#: redirected to a file. So this asks for neither: only the report of what
+#: the session already established, honestly marking anything unverified.
+_REPORT_NUDGE_OPENER_BACKGROUND = (
+    "Your last message ended by waiting on a background command — but "
+)
+#: The other shape that reaches this nudge: a short non-deferring completion
+#: (e.g. "Done.") that `_is_non_report_summary` flags on length alone. The
+#: background-run framing above is simply false there, so the opener is
+#: chosen per reply by `_looks_like_background_wait` rather than hard-coded.
+_REPORT_NUDGE_OPENER_GENERIC = (
+    "Your last message did not read as the completion report this task "
+    "needs — "
+)
+_REPORT_NUDGE = (
+    f"{_REPORT_NUDGE_MARKER} for this session, and none is coming, so "
+    "waiting further will not produce one. Do not start a new verification "
+    "run to answer this. Write the final report the task asked for now, "
+    "based on what you have already established: one `CRITERION: <text> — "
+    "MET | NOT-MET — evidence: <file:line or command+output>` line per "
+    "acceptance criterion, self-contained, with an honest NOT-MET for "
+    "anything you did not verify. Change nothing else; do not edit files."
+)
+
+#: Wall-clock ceiling for that one turn — the same reasoning as
+#: `_NUDGE_TIMEOUT_S`: this restates a verdict already reached, it does not
+#: do new work.
+_REPORT_NUDGE_TIMEOUT_S = 120.0
+
+#: Stop reasons that mean the nudge turn was cut off or failed rather than
+#: reaching a normal end-of-turn — the same precedent as
+#: `_PLANNER_TRUNCATED_STOP_REASONS` / `reviewer._TRUNCATED_STOP_REASONS`.
+#: A reply ending this way is not a report even when its TEXT happens to
+#: dodge `_is_non_report_summary` (measured: "Claude Code returned an error
+#: result: error_max_turns" and "Reached maximum number of turns (1)" both
+#: classify as non_report=False on the pinned classifier) — so `_report_nudge`
+#: checks this independently of that classifier, exactly as the coder path
+#: gates on `result.is_error` before ever reading `final_text` as a verdict.
+_REPORT_NUDGE_ABNORMAL_STOP_REASONS = ("max_turns", "max_tokens", "error", "refusal")
+
+
+def _looks_like_background_wait(text: str) -> bool:
+    """True when `text` actually names a background run/notification, as
+    opposed to any other shape `_is_non_report_summary` flags (e.g. a bare
+    "Done."). Selects `_report_nudge`'s OPENER sentence only — it is never
+    consulted by the classifier itself and never widens what counts as a
+    non-report.
+    """
+    low = text.lower()
+    return "background" in low and re.search(r"wait|notif|wake", low) is not None
+
 #: NOTE (drift): the file names in this text are a hand-kept SUMMARY of
 #: `complexity._INSTRUCTION_ROOTS` + `_REPO_INSTRUCTION_FILES` +
 #: `complexity._GATE_CONTROL_NAMES`, which is what actually decides. Prose, not
@@ -6219,6 +6283,34 @@ class Orchestrator:
             )
             return await self._raise_blocker(task, blocker, repo=repo, branch=branch)
 
+        # --- recovery: a coder that ended its turn deferring to a
+        #     background-run notification that will never arrive gets one
+        #     turn, on its own session, to write the report it owed from
+        #     what it already established (no polling: one turn cannot poll
+        #     and report, and the backgrounded process died with the turn).
+        #     The diff above is already real and committed either way — this
+        #     only recovers the report that turn owed at its end. Zero-diff
+        #     completions take `_reformat_nudge` above; this site runs with a
+        #     committed diff, including a resumed commit with no new edits.
+        try:
+            report = await self._report_nudge(
+                task, result, repo=repo, attempt_id=attempt_id)
+        except CancelRequested as exc:
+            return await self._honor_cancel(
+                task, repo, branch, str(exc), attempt_id=attempt_id)
+        except (BudgetAbort, StuckAbort, ConvergenceAbort) as exc:
+            return await self._abort_during_nudge(
+                task, repo, attempt_id, exc, result=result, branch=branch)
+        if report:
+            try:
+                result = replace(result, final_text=report)
+            except TypeError:
+                # A test double that is not a real dataclass instance.
+                result.final_text = report
+            await self.store.update_attempt(
+                attempt_id,
+                full_final_text=report[:_FULL_REPORT_MAX_CHARS] or None)
+
         # --- review: tamper guard first (cheap, deterministic pre-filter),
         #     then adversarial reviewer (the real gate, §3.3) ---
         await self.store.set_status(task, TaskStatus.REVIEWING)
@@ -8532,10 +8624,13 @@ class Orchestrator:
            behind BUDGET_EXHAUSTED; under it, the per-attempt cap fired and the
            bounded loop retries with fresh context.
         3. **Never checkpoint.** The coder's handlers commit `[WIP-PARTIAL]`
-           because the tree may hold real work. Here it provably cannot: this
-           branch only runs when `has_changes()` is false, and the nudge's own
-           `finally` has already reverted anything it wrote. A checkpoint would
-           be an empty commit that makes the next attempt look resumed.
+           because the tree may hold real work. Here it provably cannot, for
+           either of this method's two callers: `_reformat_nudge`'s call site
+           only runs when `has_changes()` is false, and `_report_nudge`'s call
+           site runs AFTER the attempt's own real work is already committed —
+           in both cases the nudge turn's own `finally` has already reverted
+           anything IT wrote on top. A checkpoint would be an empty (or
+           redundant) commit that makes the next attempt look resumed.
         """
         is_budget = isinstance(exc, BudgetAbort)
         kind = _abort_kind(exc)
@@ -9460,6 +9555,162 @@ class Orchestrator:
             getattr(nudge, "final_text", "") or "",
             len(task.acceptance_criteria or []),
         )
+
+    async def _report_nudge(
+        self, task: Task, result, *, repo: GitRepo, attempt_id: str,
+    ) -> str | None:
+        """ONE single-turn follow-up asking a coder that ended its turn
+        deferring to a background-run notification to write the report it
+        owed from what it already established (it is told not to start a
+        new verification run). Returns the replacement report text, or
+        None — in which case the caller renders the attempt exactly as it did
+        before this existed (`_NO_SUMMARY_BLOCK` / `_NO_SUMMARY_NOTE`).
+
+        Why it exists (INCIDENT: task f073bfee): a coder ran verification via
+        `run_in_background` and ended its turn with "I'll just wait for the
+        background task notification to arrive rather than polling." No such
+        notification exists — there is no wake-up for an ended turn — so the
+        attempt delivered with no report and review failed on missing
+        evidence, even though the diff was real and possibly correct. This is
+        the RECOVERY half of that fix; the PREVENTION half is the coder
+        system-prompt bullet added in `prompt_blocks.build_rules_block`.
+
+        Deliberately the sibling of `_reformat_nudge`, not a merge with it:
+        that nudge fires on a ZERO diff and asks for a FORMAT restatement of
+        an existing verdict; this one fires on a NON-empty diff and asks for
+        the REPORT a real commit is still owed. Firing this on a zero diff
+        would let a coder that did nothing at all buy a second turn by
+        merely deferring instead of restating — `_reformat_nudge` already
+        owns that turn, exclusively, via its own `_reformat_nudged` guard.
+
+        What it does NOT relax:
+        * **Empty final text gets no nudge.** Nothing to classify.
+        * **Only a genuine non-report is nudged** — classified by
+          `_is_non_report_summary` on the SAME cleaned text
+          `_summary_section` itself judges, unchanged and un-widened here.
+        * **The nudge cannot invent a summary.** It asks the coder's own
+          session to write one; if that reply is STILL a non-report, this
+          returns None and today's rendering stands.
+        * **Once per attempt, ever.** Keyed on `attempt_id`.
+        * **No new work is licensed.** The instruction asks only for a report
+          of what the session already established (see `_REPORT_NUDGE`'s own
+          comment for why it does not ask the coder to poll a background run
+          within this turn); the snapshot/revert below is the enforcement,
+          exactly as `_reformat_nudge`'s.
+        * **A reply that did not reach a normal end-of-turn is not a report,
+          whatever its text says.** `is_error` or an abnormal `stop_reason`
+          (`_REPORT_NUDGE_ABNORMAL_STOP_REASONS`) is checked BEFORE
+          `_is_non_report_summary` gets a vote — measured against the real
+          backend, "Claude Code returned an error result: error_max_turns"
+          and "Reached maximum number of turns (1)" both read as a report to
+          that classifier, so trusting it alone here would let an errored
+          nudge overwrite a real deferral with error prose.
+
+        Fail-closed on the resume capability, the worktree snapshot/revert,
+        the HEAD-move check, and the sink's three controls being re-raised
+        rather than swallowed — all for the identical reasons spelled out in
+        `_reformat_nudge`'s own docstring; not repeated here.
+
+        Unlike `_reformat_nudge` (whose call site runs BEFORE a commit
+        exists, on the zero-diff branch), this call site runs AFTER the
+        attempt has already committed. The nudge's own writes are still
+        reverted by the snapshot below and are never part of that commit;
+        a nudge that commits on its own is still caught by the HEAD-move
+        check and its reply discarded, exactly as `_reformat_nudge`'s.
+        """
+        final = (result.final_text or "").strip()
+        if not final:
+            return None
+        if not self._is_non_report_summary(self._clean_summary(final)):
+            return None
+        nudged = self.__dict__.setdefault("_report_nudged", set())
+        if attempt_id in nudged:
+            return None
+        session = getattr(result, "session_id", None)
+        caps = getattr(self.backend, "capabilities", None)
+        # FAIL CLOSED on the default — same reasoning as `_reformat_nudge`'s.
+        if not session or not getattr(caps, "session_resume", False):
+            return None
+        nudged.add(attempt_id)
+        self.emit(
+            "report_nudge",
+            "final report did not read as a completion report — one turn, "
+            "on the same session, to write the report it already owed",
+        )
+        before = self._worktree_state(repo)
+        head_before = repo.head_sha()
+        usage_baseline = dict(getattr(self, "_attempt_usage", None) or {})
+
+        def _delta() -> dict[str, int]:
+            now = getattr(self, "_attempt_usage", None) or {}
+            return {
+                k: max(int(now.get(k) or 0) - int(usage_baseline.get(k) or 0), 0)
+                for k in ("tokens_used", "cache_read_tokens",
+                          "cache_creation_tokens", "output_tokens")
+            }
+
+        opener = (_REPORT_NUDGE_OPENER_BACKGROUND
+                  if _looks_like_background_wait(final)
+                  else _REPORT_NUDGE_OPENER_GENERIC)
+        prompt = opener + _REPORT_NUDGE
+        bounds = self.config.get("bounds") or {}
+        nudge = None
+        try:
+            nudge = await asyncio.wait_for(
+                self.backend.run(
+                    prompt, cwd=repo.path, max_turns=1, effort="low",
+                    resume=session, on_event=self._agent_sink,
+                ),
+                timeout=min(
+                    float(bounds.get("attempt_timeout_s") or 3600),
+                    _REPORT_NUDGE_TIMEOUT_S),
+            )
+        except (CancelRequested, BudgetAbort, StuckAbort, ConvergenceAbort):
+            # Single-use, popped by `_abort_during_nudge` — the same
+            # attribute `_reformat_nudge`'s abort path stashes into, so the
+            # existing handler bills either nudge's partial spend unchanged.
+            self._nudge_partial_usage = _delta()
+            raise
+        except Exception as exc:  # noqa: BLE001 — best-effort, as `_reformat_nudge`'s
+            self._advisory(f"report nudge skipped: {exc}")
+            return None
+        finally:
+            self._revert_worktree_writes(repo, before)
+        if nudge is None:
+            return None
+        head_after = repo.head_sha()
+        if head_after != head_before:
+            self._advisory(
+                "the report nudge COMMITTED to the worktree despite being "
+                f"told not to ({head_before[:8]} → {head_after[:8]}); its "
+                "reply is discarded and the attempt renders with no report")
+            return None
+        await self.store.add_attempt_usage(
+            attempt_id,
+            turns_used=getattr(nudge, "num_turns", None),
+            tokens_used=getattr(nudge, "tokens_used", None),
+            output_tokens=getattr(nudge, "output_tokens", None),
+            cache_read_tokens=getattr(nudge, "cache_read_tokens", None),
+            cache_creation_tokens=getattr(nudge, "cache_creation_tokens", None),
+        )
+        # Billed above either way (the nudge turn genuinely spent whatever it
+        # spent), but an errored or truncated reply is not a report, whatever
+        # its TEXT says — checked BEFORE `_is_non_report_summary` gets a vote.
+        # See the docstring bullet: both real SDK error texts measured against
+        # that classifier read as "a report", which would let error prose
+        # overwrite a real deferral in `attempts.full_final_text`/the PR body.
+        stop = (getattr(nudge, "stop_reason", None) or "").lower()
+        if (getattr(nudge, "is_error", False)
+                or stop in _REPORT_NUDGE_ABNORMAL_STOP_REASONS):
+            self._advisory(
+                "report nudge ended abnormally "
+                f"(is_error={getattr(nudge, 'is_error', False)}, "
+                f"stop_reason={stop or None!r}); discarding its reply")
+            return None
+        reply = (getattr(nudge, "final_text", "") or "").strip()
+        if not reply or self._is_non_report_summary(self._clean_summary(reply)):
+            return None
+        return reply
 
     async def _fail_already_satisfied(
         self, task: Task, decision: ReviewDecision, *, attempt_id: str,
@@ -14671,6 +14922,8 @@ class Orchestrator:
         # already has a fresh id — and it stops the set growing for the whole
         # life of a pooled Orchestrator.
         self.__dict__.pop("_reformat_nudged", None)
+        # Same reasoning, same convention, for the report nudge's own guard.
+        self.__dict__.pop("_report_nudged", None)
         # The abort paths (attempt-timeout, stuck-abort, BudgetAbort) persist
         # THIS to the ledger, because an aborted run never produced a
         # ResultMessage to roll up. It already includes subagent spend — the
