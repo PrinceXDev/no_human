@@ -391,6 +391,14 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(worker_task, timeout=budget)
         except asyncio.TimeoutError:
             log.warning("worker drain timed out after %.0fs", budget)
+    # Setup-mode flags are per-boot state on a PROCESS-WIDE `app` singleton
+    # (startup sets them :166-167). Closes the second-lifespan-cycle leak,
+    # not the `nh start` CliRunner incident (those flags are set outside
+    # this lifespan and torn down in `start()`'s own `finally` instead).
+    if hasattr(app.state, "setup_mode"):
+        del app.state.setup_mode
+    if hasattr(app.state, "setup_reason"):
+        del app.state.setup_reason
     # An externally-supplied store is owned by whoever connected it (`nh
     # start`'s `_go()`) — it closes it, not us, or `start()`'s own use of the
     # connection after `server.serve()` returns would hit a closed store.
