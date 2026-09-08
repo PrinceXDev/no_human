@@ -2774,13 +2774,18 @@ Re-anchored again 2026-09-03 (fourth): the WIP-checkpoint resume-digest
     orchestrator.py, moving the citation from 4899 to 5037; re-verified
     against the code, not carried forward blind. db.py:2306 is untouched by
     this change.
+
+    Re-anchored again 2026-09-08 (staleness narration follow-up to ce4d4a73):
+    a docstring paragraph on `_refresh_stale_base` and the `overlapping_files=`
+    keyword on the `base_staleness` emit add 4 net lines above `_run_attempt`,
+    moving the citation from 5037 to 5041; re-verified against the code.
     """
     assert "db.py:2306" in known_issues_doc, (
         "the traceback no longer cites db.py:2306 — this test is pointed at "
         "stale text; re-derive from the current traceback"
     )
-    assert "orchestrator.py:5037" in known_issues_doc, (
-        "the traceback no longer cites orchestrator.py:5037 — this test is "
+    assert "orchestrator.py:5041" in known_issues_doc, (
+        "the traceback no longer cites orchestrator.py:5041 — this test is "
         "pointed at stale text; re-derive from the current traceback"
     )
 
@@ -2799,13 +2804,13 @@ Re-anchored again 2026-09-03 (fourth): the WIP-checkpoint resume-digest
     orch_src = ORCHESTRATOR_PY.read_text(encoding="utf-8")
     orch_body = _function_body_source(orch_src, "_run_attempt")
     orch_lines = orch_src.splitlines()
-    assert 1 <= 5037 <= len(orch_lines), "orchestrator.py is now shorter than line 5037"
-    assert "self.store.update_attempt(" in orch_lines[5036], (
-        f"orchestrator.py:5037 is now {orch_lines[5036]!r}, not the "
+    assert 1 <= 5041 <= len(orch_lines), "orchestrator.py is now shorter than line 5041"
+    assert "self.store.update_attempt(" in orch_lines[5040], (
+        f"orchestrator.py:5041 is now {orch_lines[5040]!r}, not the "
         f"update_attempt call the traceback names"
     )
     assert "self.store.update_attempt(" in orch_body, (
-        "line 5037 is no longer inside _run_attempt's body"
+        "line 5041 is no longer inside _run_attempt's body"
     )
 
 
