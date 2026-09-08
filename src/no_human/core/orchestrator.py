@@ -4534,6 +4534,144 @@ class Orchestrator:
             return False
         return True
 
+    async def _send_back_resume_round(self, task: Task, *, repo: GitRepo) -> bool:
+        """Is the round in progress a resume of a human/reviewer SEND-BACK that
+        the branch already satisfies — i.e. an independent review already
+        PASSED the current HEAD after the feedback arrived?
+
+        An earlier version compared the feedback time against the BRANCH
+        HEAD's git committer date. That is False on the very incident it was
+        written for: task 82644133's send-back arrived at 00:06:05Z, attempt
+        6 then committed ``dae99c22`` at 00:19:40Z (committer date) and
+        PASSED review on it, and attempt 7 (the zero-diff round that should
+        have landed here) never moved HEAD — ``dae99c22`` is still the tip.
+        ``feedback_at (00:06:05) > head_at (00:19:40)`` is False, so that
+        rule failed closed on the exact case it exists for. Git metadata is
+        also the wrong source of truth here: a per-attempt staleness rebase
+        or any commit amend rewrites committer dates independently of when
+        the feedback or the review actually happened.
+
+        A later version read ``task.context["review_history"]`` instead.
+        That is also False on the real data: task 82644133's attempts never
+        carry a ``review_history[].at`` entry at all — that field exists on
+        no row created before this rule — so the round-3 check could never
+        have fired on the incident it names.
+
+        The rule instead reads only the ``attempts`` table: does any OTHER
+        attempt row (excluding the one running right now) carry
+        ``review_passed == 1`` on the CURRENT HEAD's ``commit_sha``, with a
+        ``started_at`` newer than the newest ``send_back_feedback`` entry?
+        ``commit_sha`` is used for commit IDENTITY only, never for a date —
+        the round-2 committer-date rule was False on the incident precisely
+        because it tried to read a date off git. Both timestamps are PARSED
+        (``_parse_iso``), never compared as strings: ``send_back_feedback``
+        entries use ``datetime.now(timezone.utc).isoformat()`` (a ``T``, an
+        offset) while ``attempts.started_at`` is SQLite ``datetime('now')``
+        (a space, no ``T``, no offset) — ``_parse_iso`` treats the naive
+        SQLite form as UTC, so the comparison is between parsed instants,
+        never strings. (``review_history[].at`` is still WRITTEN by
+        ``_append_review_history`` — it is simply no longer read here.)
+        """
+        feedback = (task.context or {}).get("send_back_feedback") or []
+        if not feedback or not isinstance(feedback[-1], dict):
+            return False
+        feedback_at = _parse_iso(str(feedback[-1].get("at") or ""))
+        if feedback_at is None:
+            return False
+        head_sha = repo.head_sha().strip()
+        if not head_sha:
+            return False
+        rows = await self.store.list_attempts(task.id)
+        current_id = getattr(self, "_active_attempt_id", None)
+        qualifying = [
+            r for r in rows
+            if r.get("id") != current_id
+            and int(r.get("review_passed") or 0) == 1
+            and str(r.get("commit_sha") or "").strip() == head_sha
+        ]
+        if not qualifying:
+            return False
+        newest = max(qualifying, key=lambda r: str(r.get("started_at") or ""))
+        started = _parse_iso(str(newest.get("started_at") or ""))
+        if started is None:
+            return False
+        return started > feedback_at
+
+    async def _land_no_changes_needed(
+        self, task: Task, *, repo: GitRepo, attempt_id: str, result: AgentResult,
+    ) -> TaskOutcome | None:
+        """Land a send-back-resume round that produced zero diff as "no
+        changes needed", or return None to let the caller's ordinary
+        failure/escalation path run.
+
+        Fires only when ALL of: (1) `_send_back_resume_round` — some OTHER
+        `attempts` row records an independent review PASS (`review_passed`)
+        on this exact HEAD's `commit_sha`, `started_at` after the newest
+        send-back feedback; (2) an existing PR to return the human to
+        (`resolve_task_pr`) — with no PR there is nothing to await approval
+        on. Neither guard is redundant: hardcoding (1) True still fails a
+        first attempt with no PR to return to; hardcoding (2) True still
+        fails a send-back resume with no PR — each is covered by its own
+        isolating test.
+
+        RULE: never ``validate=False``. `IMPLEMENTING`/`REVIEWING` ->
+        `AWAITING_APPROVAL` reaches the target through the same validated
+        main-flow edges the normal PR-open path uses: `TESTING` first, then
+        `TESTING -> AWAITING_APPROVAL` — both always legal from the states
+        this route can start in, so no reachability check is needed. No
+        commit runs on this route, so the `TESTING` hop's phase row (opened
+        by `set_status`, `db.py::_record_phase`) is closed immediately with
+        `no_tests_run` rather than left to read as a real test phase. Status
+        writes land BEFORE anything else is recorded, so a CAS refusal
+        (`set_status` returning ``None``) leaves no `succeeded` attempt row
+        and no `no_changes_needed` marker on a task that reads failed. No
+        `mechanical_round` stamp either — that flag exempts a post-PASS
+        MECHANICAL round's token spend from the lifetime budget (db.py
+        ~2884-2892); this round is a normal, budget-counted attempt that
+        happens to need no new commit.
+        """
+        if not await self._send_back_resume_round(task, repo=repo):
+            return None
+        pr = await resolve_task_pr(self.store, task)
+        if not pr.url:
+            return None
+
+        target = TaskStatus.AWAITING_APPROVAL
+        if task.status is not target:
+            if await self.store.set_status(task, TaskStatus.TESTING) is None:
+                return None
+            await self.store.close_phase(
+                task.id, "no_tests_run",
+                reason="no changes needed — no test run in this round",
+            )
+            if await self.store.set_status(task, target) is None:
+                return None
+
+        feedback = (task.context or {}).get("send_back_feedback") or []
+        feedback_at = (
+            feedback[-1].get("at")
+            if feedback and isinstance(feedback[-1], dict) else None
+        )
+        detail = (
+            "no changes needed after the send-back; the head already "
+            "passed review"
+        )
+        await self.store.update_attempt(
+            attempt_id, status="succeeded", failure_reason=None, pr_url=pr.url,
+        )
+        merged = await self.store.merge_context(task.id, {
+            "no_changes_needed": {
+                "at": _now(),
+                "feedback_at": feedback_at,
+                "pr_url": pr.url,
+                "agent_text": (result.final_text or "").strip()[:2000],
+            },
+        })
+        task.context = merged
+        self.emit("no_changes_needed", detail, pr_url=pr.url)
+        self.emit("state", detail, status=target.value)
+        return TaskOutcome(task, status=target, pr_url=pr.url, detail=detail)
+
     async def _budget_frozen_by_pass(self, task: Task) -> bool:
         """Is lifetime-budget enforcement frozen for the round about to run?
 
@@ -5875,6 +6013,10 @@ class Orchestrator:
                             attempt_n=attempt_n, result=result, base=base,
                         )
             if resumed_commit is None:
+                landed = await self._land_no_changes_needed(
+                    task, repo=repo, attempt_id=attempt_id, result=result)
+                if landed is not None:
+                    return landed
                 detail = _NO_CHANGES_DETAIL
                 # Keep what the agent SAID. Task d9d458b5 explained three times
                 # that the work was already committed and that it would not
@@ -10765,6 +10907,9 @@ class Orchestrator:
         40-line diff, so the human was reading a verdict on code that is not in
         front of them. Stamping is the only thing that makes the two separable
         afterwards.
+
+        ``"at"`` records when THIS review concluded. Nothing reads it today:
+        `_send_back_resume_round` keys on the `attempts` table instead.
         """
         ctx = task.context or {}
         history = list(ctx.get("review_history") or [])
@@ -10772,6 +10917,7 @@ class Orchestrator:
             "round": len(history) + 1,
             "sha": (commit_sha or "").strip(),
             "passed": bool(decision.passed),
+            "at": _now(),
             "blocking": [
                 f"{i.label} — {i.evidence[:160]}" for i in decision.blocking_items[:5]
             ],
