@@ -36,6 +36,7 @@ from ..agent.claude_backend import (
 from ..review import tamper_adjudication
 from ..review.selfcheck import ChecklistItem
 from ..review.lint_evidence import collect_lint_evidence, format_lint_evidence
+from ..review.type_evidence import collect_type_evidence, format_type_evidence
 from ..review.wiring_evidence import (
     collect_wiring_evidence,
     format_wiring_evidence,
@@ -58,8 +59,8 @@ _UNPARSED_TAIL_CHARS = 300
 # clean — both produced "" before this, so a broken lint/wiring collector
 # silently weakened constraint #3's evidence basis (audit top-8 #8). The
 # marker is injected in place of "" so it still flows through the existing
-# `lint_evidence`/`wiring_evidence` params and renders in its section, but
-# `_reading_scope` (below) must never count it as "the lint/wiring findings".
+# `lint_evidence`/`wiring_evidence`/`type_evidence` params and renders in its
+# section, but `_reading_scope` (below) must never count it as findings.
 _EVIDENCE_FAILED_PREFIX = "[evidence collection FAILED:"
 
 
@@ -694,7 +695,9 @@ _UNTRUSTED_INPUT = (
 #:     omitted from every review that touches it;
 #:   * `held_out_output` is "" whenever no held-out suite ran;
 #:   * `lint_evidence`/`wiring_evidence` are "" on a repo with no ruff config
-#:     and on both collectors' advisory except-paths.
+#:     and on both collectors' advisory except-paths; `type_evidence` is "" on
+#:     a repo that configures no type checker and whenever its two runs did not
+#:     both complete comparably.
 #:
 #: So the gate — the one component whose entire value is evidence-based
 #: judgement — was told evidence was in front of it when it was not, and the
@@ -725,6 +728,7 @@ def _reading_scope(
     omitted_files: list[str] | None,
     lint_evidence: str,
     wiring_evidence: str,
+    type_evidence: str,
 ) -> str:
     """The READING SCOPE block, enumerating ONLY the sections actually rendered.
 
@@ -749,6 +753,14 @@ def _reading_scope(
         have.append("the lint findings")
     if wiring_evidence and not wiring_evidence.startswith(_EVIDENCE_FAILED_PREFIX):
         have.append("the wiring findings")
+    # Same computed-not-asserted rule as its two siblings above. `type_evidence`
+    # is "" whenever the collector did not run — no configured checker, a
+    # checker that crashed, two runs whose environments were not comparable —
+    # and this enumeration must never claim a type check the reviewer does not
+    # have below (issue #114: a crashed checker attaches no evidence rather than
+    # a false clean verdict).
+    if type_evidence and not type_evidence.startswith(_EVIDENCE_FAILED_PREFIX):
+        have.append("the net-new type diagnostics")
     listed = have[0] if len(have) == 1 else f"{', '.join(have[:-1])} and {have[-1]}"
     omitted_note = (
         "\nChanged files too large to include are named below as NOT included in\n"
@@ -763,6 +775,86 @@ def _reading_scope(
         f"here costs a full pass over this context and returns no new fact.{omitted_note}\n"
         + _READING_SCOPE_TAIL
     )
+
+
+async def _collect_gate_evidence(
+    repo_path: Path, before_ref: str, after_ref: str,
+    *, with_type_evidence: bool = True,
+) -> tuple[str, str, str]:
+    """The three deterministic collectors, as rendered blocks: lint, wiring,
+    net-new type diagnostics.
+
+    Each gets its OWN try. One collector's failure must not take the other two
+    down with it, and a collector that raised must not look like a collector
+    that ran clean — hence `_evidence_failure_marker` in place of "" (see its
+    definition). None of the three can block or fail the review; the worst any
+    of them does is contribute no section.
+
+    * lint (SCRUM-64) is scoped to the lines this diff CHANGED: a pre-existing
+      ruff violation on an untouched line is not evidence about the agent's
+      work.
+    * wiring feeds the GOAL REACHABILITY judgment and is never a verdict alone.
+    * type (issue #114 phase 1) runs the repo's OWN configured checker at the
+      merge base and here and subtracts, so a repo carrying pre-existing errors
+      does not drown the signal. Deliberately NOT scoped to changed lines the
+      way lint is — the characteristic net-new type error lands at a call site
+      the diff never touched, and that filter would drop exactly the
+      diagnostics worth having. It informs the reviewer and changes no merge
+      rule.
+
+    Only the type collector is optional (`with_type_evidence`) and only it goes
+    to a thread, because only it is expensive: lint and wiring are a few git
+    reads and a ruff call, while a whole-project type check can spend the whole
+    `TYPE_TIMEOUT`. The caller passes False on the single-turn route, where the
+    point of the route is to spend less on a small diff.
+    """
+    try:
+        changed = _changed_paths(repo_path, before_ref, after_ref)
+        lint_evidence = format_lint_evidence(
+            collect_lint_evidence(
+                repo_path, changed, before_ref=before_ref, after_ref=after_ref,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
+        lint_evidence = _evidence_failure_marker("lint", exc)
+    try:
+        wiring_evidence = format_wiring_evidence(
+            collect_wiring_evidence(repo_path, before_ref, after_ref)
+        )
+    except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
+        wiring_evidence = _evidence_failure_marker("wiring", exc)
+    type_evidence = ""
+    if with_type_evidence:
+        try:
+            # OFF the event loop. The other two are seconds of git and ruff; this
+            # one can spend its whole `TYPE_TIMEOUT` budget in blocking
+            # `subprocess.run`, and a synchronous call here stalls every other
+            # task the scheduler is running, not just this review.
+            type_evidence = format_type_evidence(
+                await asyncio.to_thread(
+                    collect_type_evidence, repo_path, before_ref, after_ref,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
+            type_evidence = _evidence_failure_marker("type", exc)
+    return lint_evidence, wiring_evidence, type_evidence
+
+
+def _evidence_section(text: str) -> str:
+    """Wrap one deterministic-evidence block for the prompt; "" when empty.
+
+    The three collectors — ruff (SCRUM-64), wiring, and net-new type
+    diagnostics (issue #114) — share one contract, and it is easier to keep
+    them honest in one place than in three: the output is machine-produced and
+    clearly labeled so the reviewer can tell it from its own judgment, it is
+    never a verdict by itself, and it is ABSENT rather than empty when the
+    collector did not run. That last property is the load-bearing one. A repo
+    that configures no ruff and no type checker renders neither section, which
+    both keeps its prompt byte-identical to the one it got before these
+    collectors existed, and — because nothing is said — leaves the reviewer
+    unable to mistake our silence for a clean result.
+    """
+    return f"\n{text}\n\n" if text else ""
 
 
 def _cap_section(text: str, cap: int = _AUX_CAP) -> str:
@@ -840,6 +932,7 @@ def _build_review_prompt(
     allow_tools: bool = True,
     lint_evidence: str = "",
     wiring_evidence: str = "",
+    type_evidence: str = "",
     draft_pr: str = "",
     draft_pr_absent: str = "",
     reviewed_sha: str = "",
@@ -997,6 +1090,7 @@ def _build_review_prompt(
                 omitted_files=omitted_files,
                 lint_evidence=lint_evidence,
                 wiring_evidence=wiring_evidence,
+                type_evidence=type_evidence,
             )
         )
         tool_rule = (
@@ -1036,13 +1130,9 @@ def _build_review_prompt(
             + " — read them with your tools before making any claim about them.\n\n"
         )
 
-    # Deterministic tool output, clearly labeled so the reviewer can tell it
-    # apart from its own judgment. Only attached when non-empty — a repo with
-    # no ruff config gets no lint section at all (SCRUM-64).
-    lint_section = f"\n{lint_evidence}\n\n" if lint_evidence else ""
-    # Same contract as lint: deterministic, labeled, absent when empty. Feeds
-    # the GOAL REACHABILITY judgment; never a verdict by itself.
-    wiring_section = f"\n{wiring_evidence}\n\n" if wiring_evidence else ""
+    lint_section = _evidence_section(lint_evidence)
+    wiring_section = _evidence_section(wiring_evidence)
+    type_section = _evidence_section(type_evidence)
 
     next_pass = 4
     rules_pass = ""
@@ -1160,6 +1250,7 @@ def _build_review_prompt(
         + linked_section
         + lint_section
         + wiring_section
+        + type_section
         + _annotated_test_output(test_output)
         + f"{held_section}"
         + f"{failing_ids_section}"
@@ -2375,6 +2466,7 @@ class AdversarialReviewer:
         full_files, omitted_files = "", []
         lint_evidence = ""
         wiring_evidence = ""
+        type_evidence = ""
         # Multi-repo: show the reviewer every LINKED repo's diff too, so it
         # judges the whole task's change and can FAIL on a broken linked-repo
         # change. Only in the multi-turn (no diff_override) gate path — the
@@ -2394,33 +2486,11 @@ class AdversarialReviewer:
             full_files, omitted_files = _full_file_context(
                 repo_path, before_ref, after_ref,
             )
-            # SCRUM-64: deterministic lint evidence, scoped to the lines this
-            # diff changed — a pre-existing violation on an untouched line is
-            # not evidence about the agent's work. Never blocks the review —
-            # any failure here just means no lint section.
-            try:
-                changed = _changed_paths(repo_path, before_ref, after_ref)
-                lint_evidence = format_lint_evidence(
-                    collect_lint_evidence(
-                        repo_path, changed,
-                        before_ref=before_ref, after_ref=after_ref,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
-                lint_evidence = _evidence_failure_marker("lint", exc)
-            # Same advisory contract for wiring evidence: it feeds the
-            # GOAL REACHABILITY judgment and never blocks by itself.
-            try:
-                wiring_evidence = format_wiring_evidence(
-                    collect_wiring_evidence(repo_path, before_ref, after_ref)
-                )
-            except Exception as exc:  # noqa: BLE001 — advisory, never blocks review
-                wiring_evidence = _evidence_failure_marker("wiring", exc)
         # Review depth scales with diff size: a small, risk-free diff (routed
         # by `core/review_routing.route`, called before this method) gets the
         # same single-turn, no-tools treatment as `diff_override` — the diff,
-        # the full text of every changed file, lint and wiring evidence are
-        # already assembled above with zero tool calls, so the exploration
+        # the full text of every changed file, lint, wiring and type evidence are
+        # already assembled with zero tool calls, so the exploration
         # turns buy nothing. Guarded by completeness, independent of what the
         # router decided: `_full_file_context` includes a changed file WHOLE
         # OR NOT AT ALL, so an omission (a small-by-line-count edit to a large
@@ -2428,10 +2498,23 @@ class AdversarialReviewer:
         # edits) or a diff cut by `_DIFF_CAP` means the `allow_tools=False`
         # prompt would be missing something it also cannot go read — that
         # always takes the multi-turn path regardless of the route.
+        #
+        # DECIDED BEFORE the evidence is collected, not after, because the route
+        # is now an input to the collection: the cheap route exists to spend
+        # less on a small, low-risk diff, and paying up to `TYPE_TIMEOUT` of
+        # whole-project type checking on it defeats the routing decision that
+        # was just made. Lint and wiring are seconds and stay on both routes.
         route_single_turn = (
             single_turn and not diff_override
             and not omitted_files and diff_total_len == len(diff)
         )
+        if not diff_override:
+            lint_evidence, wiring_evidence, type_evidence = (
+                await _collect_gate_evidence(
+                    repo_path, before_ref, after_ref,
+                    with_type_evidence=not route_single_turn,
+                )
+            )
         prompt = _build_review_prompt(
             task,
             diff,
@@ -2446,6 +2529,7 @@ class AdversarialReviewer:
             linked_section=linked_section,
             lint_evidence=lint_evidence,
             wiring_evidence=wiring_evidence,
+            type_evidence=type_evidence,
             allow_tools=not diff_override and not route_single_turn,
             draft_pr=draft_pr,
             draft_pr_absent=draft_pr_absent,

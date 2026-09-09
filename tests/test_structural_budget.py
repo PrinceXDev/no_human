@@ -1585,6 +1585,7 @@ FROZEN_FILE_LINES = {
     # 2915 -> 2945 (+30): reviewer-backend construction honoring the explicit
     # Settings choice (6d part 1). Measured on the merge result with the
     # scanner below, never summed.
+    # --- main's line of history from 2945 ---
     # 2945 -> 2974 (+29): fix for "a red pre-review test run reaches the
     # coder even when the review fails" — `_build_review_prompt` and
     # `review()` (gate mode) gain the `failing_test_ids`/
@@ -1610,7 +1611,27 @@ FROZEN_FILE_LINES = {
     # plausibly explaining the failure (see the matching FROZEN_FUNCTION_
     # LINES entry for `_build_review_prompt` for the incident this fixes).
     # Measured on this tree with the scanner below.
-    "review/reviewer.py": 2994,
+    # --- PR #164's line of history, branched from the same 2945 ---
+    # 2945 -> 3004 (+59): net-new type diagnostics as a third deterministic
+    # evidence collector (issue #114 phase 1) — the `type_evidence` parameter
+    # and section, its READING SCOPE branch, and the two extracted helpers
+    # (`_collect_gate_evidence`, `_evidence_section`) that keep BOTH
+    # `AdversarialReviewer.review` and `_build_review_prompt` under the
+    # function-line threshold rather than adding two new frozen entries.
+    # Measured on that tree with the scanner below.
+    # 3004 -> 3029 (+25): PR #164 review round 1 — `_collect_gate_evidence`
+    # becomes async and takes `with_type_evidence`, so the expensive collector
+    # runs off the event loop (`asyncio.to_thread`) and is skipped entirely on
+    # the single-turn route, whose whole purpose is to spend less on a small
+    # diff. The route decision moves ABOVE the collection because it is now an
+    # input to it. Measured on that tree with the scanner below.
+    # --- the two lines meet here ---
+    # 2994 -> 3078 (+84): PR #164 lands the type-evidence collector on a main
+    # that had itself moved to 2994 in unrelated work. MEASURED on the merge
+    # result by the scanner's own metric, never summed: an earlier revision of
+    # this comment recorded 3063 from an older base and was left behind when
+    # main moved, which is exactly the drift this ledger exists to prevent.
+    "review/reviewer.py": 3078,
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.

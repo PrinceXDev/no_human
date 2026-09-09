@@ -4,7 +4,7 @@ This is the detail the front page links to. It was the README's longest section
 until 2026-08-01; nothing here was deleted, only moved off a page whose job is
 to get you to a first task.
 
-Four gates, and one input they run on. All of it is code, not prompt
+Four gates, and the deterministic inputs they run on. All of it is code, not prompt
 instructions, and the two deterministic gates run before the review gate does.
 (The tamper guard's adjudicator runs on the reviewer tier, so a flagged attempt
 does spend reviewer-tier tokens — just not on the gate review.)
@@ -174,6 +174,74 @@ context, so the reviewer judges against machine output instead of reading the
 diff cold. It uses the target repo's own ruff config and attaches nothing if the
 repo has none, so no_human never imposes its style on yours. It cannot block on
 its own: any failure returns empty rather than stalling the review.
+
+## Net-new type diagnostics — also an input, not a gate
+
+[`src/no_human/review/type_evidence.py`](../src/no_human/review/type_evidence.py)
+answers one question for the reviewer: **what type errors does this diff
+introduce that the merge base did not already have?** If the repo under review
+configures a type checker — `pyrightconfig.json` or `[tool.pyright]`,
+`[tool.mypy]`/`mypy.ini`/a `[mypy]` section in `setup.cfg`, or `tsconfig.json` —
+the same checker is run twice with the same arguments, over whatever that
+checker's own configuration admits —
+once at the merge base, once at the reviewed commit — and the base result is
+subtracted from the after one. A repo carrying 400 pre-existing errors therefore
+reports `net-new: 0`, not 400.
+
+Both runs happen in a throwaway `git worktree`, and neither ever runs in the
+tree under review. That is not housekeeping. The collector runs inside the
+window the orchestrator brackets with `reviewer_worktree.snapshot` and
+`.compare`, so a checker that drops `.mypy_cache/` or a `*.tsbuildinfo` into the
+attempt's tree makes that compare report an added path — and the orchestrator
+charges it to the reviewer as `reviewer_wrote`, reverting and replacing a real
+verdict with an integrity failure that nobody caused. Running both sides in
+worktrees also means neither sees untracked files, so a scratch file left in the
+working tree cannot produce a diagnostic that is "net-new" only because the base
+could never have had it.
+
+Four properties are worth knowing, because each one is a defect this design
+had to avoid rather than a feature:
+
+- **Not scoped to changed lines**, unlike the lint evidence above. The
+  characteristic net-new type error appears at a *call site the diff never
+  touched* — narrow a parameter and every caller lights up — so a changed-line
+  filter would discard exactly the diagnostics worth having.
+- **Fingerprints ignore line numbers.** One inserted import shifts every
+  diagnostic below it; a key that included the line would read the whole file
+  as newly broken. `_fingerprint` in `type_evidence.py` keys on path, code and
+  a digit-normalised message, counted as a multiset.
+- **It reports that it did not run, by saying nothing.** A missing binary, a
+  crashed checker, output that does not parse, a base worktree that cannot be
+  built, or a base tree whose environment is poorer than the after tree's
+  (`_environments_comparable` in `type_evidence.py`) all yield `ran=False`, and
+  `format_type_evidence` then renders **no section at all** — so absence never
+  reads as a clean bill of health. A check that did run and found nothing
+  renders `net-new: 0` explicitly, which is a different and usable fact.
+- **A worktree carries no installed dependencies**, and that bounds what this
+  can see. `mypy` is unaffected, because it resolves imports from no_human's own
+  environment and therefore behaves identically on both sides. `tsc` and
+  `pyright` are not: a project whose dependencies live in `node_modules` or a
+  project `.venv` is degraded on both sides equally, so unresolved-import errors
+  cancel in the subtraction and a `net-new: 0` from those two is weaker evidence
+  than it reads as — a diff that breaks a call into a dependency can be missed.
+  Treat a Python repo checked by `mypy` as the case this is measured on.
+
+Like lint, it uses only the repo's own configuration and adds no dependency: a
+repo that configures no type checker spawns no subprocess. The checker binary is
+resolved from no_human's own `PATH`, never from a `.venv` or `node_modules`
+inside the repo under review. It changes no merge rule — the diagnostics go to
+the reviewer and the human, who draw the conclusion.
+
+Two things the checker itself does are worth knowing before you enable one,
+because they are the checker's behaviour and not no_human's; both are declared
+against this module in
+[`tests/test_egress_allowlist.py`](../tests/test_egress_allowlist.py). The PyPI
+`pyright` distribution is a launcher whose first run **downloads** a node
+runtime and the `pyright` npm package, so a review on a machine that resolves
+that wrapper makes a network call. And `mypy` imports the modules a `plugins =`
+line names, read from the config of the repo under review — the harness already
+runs that repo's tests, so it is not a new trust boundary, but it is the first
+time the review half executes anything the reviewed repo wrote.
 
 ## A tamper guard against a self-gutted test suite
 

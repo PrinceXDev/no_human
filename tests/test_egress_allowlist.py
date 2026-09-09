@@ -822,6 +822,31 @@ ALLOWLIST: dict[str, dict[str, Allowed]] = {
             "whatever the repo's test command / pytest runs",
             _ON + "the bugfix repro gate runs the repo's own tests"),
     },
+    # The same SHAPE as the two above — a tool the repo under review configures,
+    # run one-shot — but not the same destination, so it is spelled out rather
+    # than waved through. The collector runs exactly one of `pyright`, `mypy` or
+    # `tsc` (issue #114, net-new type diagnostics as review evidence). argv[0] is
+    # whatever `shutil.which` resolved, so the scanner cannot name the program
+    # and the channel is <dynamic> rather than three named ones.
+    #
+    # `mypy` and `tsc` read files and write stdout, and would be a PROGRAMS
+    # classification on their own. `pyright` is why this is an ALLOWLIST line
+    # instead: the PyPI `pyright` distribution is a LAUNCHER, and its first run
+    # downloads a node runtime and the `pyright` npm package before it checks
+    # anything. On a machine whose PATH resolves that wrapper, a review makes a
+    # network call that nothing in this repo asked for — so the line has to say
+    # so, and an operator has to be able to read it here and decide.
+    "review/type_evidence.py": {
+        "exec:<dynamic>": Allowed(
+            "nothing, for `mypy` and `tsc` — both read files and write stdout. "
+            "For `pyright` resolved to the PyPI launcher: the nodejs.org "
+            "distribution host and registry.npmjs.org, on that launcher's "
+            "first run only, to fetch the runtime and the npm package it wraps",
+            _ON + "a gate review of a repo that ITSELF configures pyright, mypy "
+                  "or tsc (pyrightconfig.json, [tool.pyright], [tool.mypy], "
+                  "mypy.ini, setup.cfg [mypy], or tsconfig.json); a repo that "
+                  "configures none spawns nothing at all"),
+    },
     # This module used to hold a THIRD channel: `_probe_github_ambient` shelled
     # out to `gh auth status` — measured 1700-2036 ms, a network round-trip —
     # from `ambient_available("github")`, on a default install, when GitHub was
