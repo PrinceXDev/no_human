@@ -879,6 +879,79 @@ _VERIFIER_TIMEOUT = 180
 _VERIFIER_RETRY_MIN_TIMEOUT = 60
 _VERIFIER_RETRY_TIMEOUT = max(_VERIFIER_RETRY_MIN_TIMEOUT, _VERIFIER_TIMEOUT // 2)
 
+#: A red run on a large suite can carry tens of thousands of failing ids —
+#: measured incident: 96,465 one-line failures persisted a 966KB
+#: `attempts.test_results` row (953KB of it `failing_tests` alone) and a
+#: 1.36MB ledger `tests.md`. In-memory attribution (`_newly_failing_vs_base`,
+#: `_owned_failing_tests`) still needs the FULL list — only what is
+#: persisted/emitted/rendered is bounded, at 200: enough ids for a human to
+#: triage without opening the raw run, small enough that the worst case never
+#: threatens the column/ledger size again.
+_MAX_PERSISTED_FAILING_TESTS = 200
+
+
+def _bounded_failing_ids(ids: "list[str] | None") -> "tuple[list[str], int]":
+    """Keep the first `_MAX_PERSISTED_FAILING_TESTS` ids; return (kept,
+    dropped-count). Used only at PERSISTENCE/emission sites — never on the
+    list handed to the base-tree/ownership checks, which need every id."""
+    ids = list(ids or [])
+    if len(ids) <= _MAX_PERSISTED_FAILING_TESTS:
+        return ids, 0
+    return ids[:_MAX_PERSISTED_FAILING_TESTS], len(ids) - _MAX_PERSISTED_FAILING_TESTS
+
+
+def _bounded_test_results(test_results: dict) -> dict:
+    """Copy of *test_results* whose id lists are bounded for PERSISTENCE (the
+    `attempts.test_results` column, which the `tests` event and the evidence
+    ledger's `tests.md` both render from).
+
+    `failing_tests` and, with the same bound, its sibling id lists in the
+    same dict (`pre_existing_failures`, `owned_failures`, `flaky_excused`)
+    are each truncated to the first `_MAX_PERSISTED_FAILING_TESTS`, and each
+    gets its OWN `<key>_dropped` count when it actually got truncated (the
+    legacy `failing_tests_dropped` name is kept for `failing_tests` itself,
+    for backward compatibility with existing readers) — small runs stay
+    byte-identical to before this bound existed.
+
+    Idempotent: re-wrapping an already-bounded dict truncates nothing
+    further and does not clobber an existing `<key>_dropped` count —
+    `_environment_test_failure` re-spreads a dict its caller already
+    bounded, and that second wrap must be a no-op.
+    """
+    out = dict(test_results)
+    failing_tests = out.get("failing_tests")
+    dropped = 0
+    if failing_tests:
+        kept, dropped = _bounded_failing_ids(failing_tests)
+        out["failing_tests"] = kept
+    for key in ("pre_existing_failures", "owned_failures", "flaky_excused"):
+        if out.get(key):
+            kept_sibling, dropped_sibling = _bounded_failing_ids(out[key])
+            out[key] = kept_sibling
+            if dropped_sibling:
+                out[f"{key}_dropped"] = dropped_sibling
+    if dropped:
+        out["failing_tests_dropped"] = dropped
+    return out
+
+
+def _bounded_join_ids(ids: "list[str] | None", limit: int = _MAX_PERSISTED_FAILING_TESTS) -> str:
+    """Render an id list for a TEXT join (event message / `failure_reason`
+    string) bounded to *limit* ids, appending "… and K more" for the true
+    remainder instead of joining every id — the same 200-id bound applied to
+    persisted/emitted id LISTS, applied here to id PROSE, so a pathological
+    run's `failure_reason`/`tests` message text cannot itself grow to
+    MB-scale even though the underlying list it was built from is unbounded
+    in memory.
+    """
+    ids = list(ids or [])
+    if len(ids) <= limit:
+        return ", ".join(ids)
+    kept = ids[:limit]
+    dropped = len(ids) - limit
+    return ", ".join(kept) + f", … and {dropped} more"
+
+
 # INCIDENT (2026-08-20 16:54 UTC, personal2 profile): three reviewer sessions
 # — 365b7868, 624c3184, 5ca0e5d8 — died within eleven seconds of each other
 # with the bare, causeless "Claude Code returned an error result: success"
@@ -6708,9 +6781,11 @@ class Orchestrator:
             if not plan_result.ok:
                 text, blocks, blocks_dropped, artifact_path = self._red_test_detail(
                     task, layer_results, attempt_n=attempt_seq)
+            _kept, _dropped = _bounded_failing_ids(failing_tests)
             self.emit("tests", plan_result.summary + (f"\n{text}" if text else ""),
-                       ok=plan_result.ok, failing_tests=failing_tests,
-                       tests_log=artifact_path)
+                       ok=plan_result.ok, failing_tests=_kept,
+                       tests_log=artifact_path,
+                       **({"failing_tests_dropped": _dropped} if _dropped else {}))
             # Build aggregate test_results for the attempt record.
             total_passed = sum(
                 (lr.result.passed if lr.result else 0) for lr in plan_result.layer_results
@@ -6734,7 +6809,7 @@ class Orchestrator:
                 "failure_blocks_dropped": blocks_dropped,
             }
             await self.store.update_attempt(
-                attempt_id, test_results=layer_test_results,
+                attempt_id, test_results=_bounded_test_results(layer_test_results),
             )
             if any_ran and not plan_result.ok:
                 # Extracted to `_layered_tests_failed_outcome` (structural
@@ -6781,13 +6856,15 @@ class Orchestrator:
             not_run = ("NOT RUN — " if not test_result.ran
                        and not getattr(test_result, "invocation_error", False)
                        else "")
+            _kept, _dropped = _bounded_failing_ids(failing_tests)
             self.emit(
                 "tests",
                 not_run + test_result.summary
                 + (" (reused the reviewer's run)" if was_cached else "")
                 + (f"\n{text}" if text else ""),
-                ok=test_result.ok, cached=was_cached, failing_tests=failing_tests,
+                ok=test_result.ok, cached=was_cached, failing_tests=_kept,
                 ran=test_result.ran, tests_log=artifact_path,
+                **({"failing_tests_dropped": _dropped} if _dropped else {}),
             )
             # Deliberately emitted AFTER the red summary above: the
             # concurrent run's red result must land on the record first,
@@ -6819,7 +6896,7 @@ class Orchestrator:
             }
             await self.store.update_attempt(
                 attempt_id,
-                test_results=base_test_results,
+                test_results=_bounded_test_results(base_test_results),
             )
             if test_result.ran and not test_result.ok and not serial_passed:
                 # Ownership (cheap: a git-diff lookup, no test re-run) is
@@ -6877,18 +6954,20 @@ class Orchestrator:
                             "tests failed: this change's own test(s) failed "
                             "and also matched an invocation-error pattern — "
                             "ownership always bills the attempt, the base "
-                            "tree is never consulted: " + ", ".join(owned)
+                            "tree is never consulted: " + _bounded_join_ids(owned)
                         )
                         stuck.record(test_result.output or detail)
+                        _kept, _dropped = _bounded_failing_ids(failing_tests)
                         self.emit("tests", detail, ok=False,
-                                  failing_tests=failing_tests)
+                                  failing_tests=_kept,
+                                  **({"failing_tests_dropped": _dropped} if _dropped else {}))
                         await self.store.update_attempt(
                             attempt_id, status="failed", failure_reason=detail,
-                            test_results={
+                            test_results=_bounded_test_results({
                                 **base_test_results,
                                 "ok": False,
                                 "invocation_error": True,
-                            },
+                            }),
                         )
                         return TaskOutcome(
                             task, status=TaskStatus.FAILED, detail=detail
@@ -6912,12 +6991,12 @@ class Orchestrator:
                         self.emit("tests", detail, ok=False)
                         await self.store.update_attempt(
                             attempt_id, status="failed", failure_reason=detail,
-                            test_results={
+                            test_results=_bounded_test_results({
                                 **base_test_results,
                                 "ok": False,
                                 "invocation_error": True,
                                 "reproduces_on_base": False,
-                            },
+                            }),
                         )
                         return TaskOutcome(
                             task, status=TaskStatus.FAILED, detail=detail
@@ -6939,12 +7018,12 @@ class Orchestrator:
                         # earlier write held (`failing_tests`, `failure_
                         # blocks`) or it silently drops them. `base_test_
                         # results` is that one shared dict, built once above.
-                        test_results={
+                        test_results=_bounded_test_results({
                             **base_test_results,
                             "ok": False,
                             "invocation_error": True,
                             "reproduces_on_base": on_base,
-                        },
+                        }),
                     )
                 else:
                     # A plain red run used to fail the attempt with NO check
@@ -6984,18 +7063,20 @@ class Orchestrator:
                         note = (
                             "tests failed, but every failing test already fails "
                             "on the base tree — pre-existing, not introduced by "
-                            "this change: " + ", ".join(failing_tests)
+                            "this change: " + _bounded_join_ids(failing_tests)
                             + (f"\n{text}" if text else "")
                         )
+                        _kept, _dropped = _bounded_failing_ids(failing_tests)
                         self.emit("tests", note, ok=True,
-                                  failing_tests=failing_tests, pre_existing=True,
-                                  tests_log=artifact_path)
+                                  failing_tests=_kept, pre_existing=True,
+                                  tests_log=artifact_path,
+                                  **({"failing_tests_dropped": _dropped} if _dropped else {}))
                         await self.store.update_attempt(
                             attempt_id,
-                            test_results={
+                            test_results=_bounded_test_results({
                                 **base_test_results,
                                 "pre_existing_failures": failing_tests,
-                            },
+                            }),
                         )
                     else:
                         # Extracted to `_failed_tests_outcome` (structural
@@ -12239,7 +12320,7 @@ class Orchestrator:
         await self.store.update_attempt(
             attempt_id, status="failed", failure_reason=detail,
             infra_failure=1,
-            test_results={**test_results, "environment_error": True},
+            test_results=_bounded_test_results({**test_results, "environment_error": True}),
         )
         evidence = "\n\n".join(result.failure_blocks) if result is not None else ""
         blocker = Blocker(
@@ -12678,7 +12759,7 @@ class Orchestrator:
         is_stuck = stuck.record(fail_output) if fail_output else False
         detail = f"tests failed: {plan_result.summary}"
         if failing_tests:
-            detail += " — " + ", ".join(failing_tests)
+            detail += " — " + _bounded_join_ids(failing_tests)
         if is_stuck:
             self.emit("stuck", "same failure signature repeated; resetting context")
         # The stuck note is the one-line triage summary — it must sit
@@ -12771,14 +12852,18 @@ class Orchestrator:
             note = (
                 "tests failed, then passed on an identical "
                 "bounded re-run — flaky on this tree, not "
-                "attributed to this change: " + ", ".join(flaky)
+                "attributed to this change: " + _bounded_join_ids(flaky)
             )
+            _kept, _dropped = _bounded_failing_ids(failing_tests)
+            _flaky_kept, _flaky_dropped = _bounded_failing_ids(flaky)
             self.emit("tests", note, ok=True,
-                      failing_tests=failing_tests,
-                      flaky_excused=flaky)
+                      failing_tests=_kept,
+                      flaky_excused=_flaky_kept,
+                      **({"failing_tests_dropped": _dropped} if _dropped else {}),
+                      **({"flaky_excused_dropped": _flaky_dropped} if _flaky_dropped else {}))
             await self.store.update_attempt(
                 attempt_id,
-                test_results={
+                test_results=_bounded_test_results({
                     "ran": test_result.ran, "ok": test_result.ok,
                     "passed": test_result.passed,
                     "failed": test_result.failed,
@@ -12788,20 +12873,27 @@ class Orchestrator:
                     "flaky_excused": flaky,
                     "failure_blocks": blocks,
                     "failure_blocks_dropped": blocks_dropped,
-                },
+                }),
             )
             return None
         is_stuck = stuck.record(test_result.output)
         detail = f"tests failed: {test_result.summary}"
         if attributed:
-            detail += " — " + ", ".join(attributed)
+            detail += " — " + _bounded_join_ids(attributed)
         if newly_failing:
             detail += " (newly failing vs the base tree)"
-        owned_attr = [t for t in attributed if t in set(owned)]
+        # `owned_set` is built ONCE here rather than inside the list
+        # comprehension's `if` clause — `set(owned)` there would be
+        # rebuilt from scratch on every element of `attributed`
+        # (O(n×m) at scale: a 30k-id attributed list against a
+        # multi-thousand-id owned list) since a comprehension's `if`
+        # expression is part of its per-iteration body, not hoisted.
+        owned_set = set(owned)
+        owned_attr = [t for t in attributed if t in owned_set]
         if owned_attr:
             detail += (
                 " — this change's own test(s): "
-                + ", ".join(owned_attr)
+                + _bounded_join_ids(owned_attr)
             )
         if is_stuck:
             self.emit("stuck", "same failure signature repeated; resetting context")
@@ -12830,20 +12922,24 @@ class Orchestrator:
         if excerpt_block:
             detail += "\n" + excerpt_block
         if owned_attr:
+            _kept, _dropped = _bounded_failing_ids(failing_tests)
+            _owned_kept, _owned_dropped = _bounded_failing_ids(owned_attr)
             self.emit(
                 "tests",
                 "tests failed on test(s) this change added or "
                 "modified — not excusable as flaky or "
-                "pre-existing: " + ", ".join(owned_attr),
+                "pre-existing: " + _bounded_join_ids(owned_attr),
                 ok=False,
-                failing_tests=failing_tests,
-                owned_failures=owned_attr,
+                failing_tests=_kept,
+                owned_failures=_owned_kept,
+                **({"failing_tests_dropped": _dropped} if _dropped else {}),
+                **({"owned_failures_dropped": _owned_dropped} if _owned_dropped else {}),
             )
             await self.store.update_attempt(
                 attempt_id,
                 status="failed",
                 failure_reason=detail,
-                test_results={
+                test_results=_bounded_test_results({
                     "ran": test_result.ran, "ok": test_result.ok,
                     "passed": test_result.passed,
                     "failed": test_result.failed,
@@ -12853,7 +12949,7 @@ class Orchestrator:
                     "owned_failures": owned_attr,
                     "failure_blocks": blocks,
                     "failure_blocks_dropped": blocks_dropped,
-                },
+                }),
             )
         else:
             await self.store.update_attempt(attempt_id, status="failed", failure_reason=detail)
@@ -18495,6 +18591,15 @@ class Orchestrator:
                 self._advisory(f"prior-attempt findings read failed: {exc}")
 
             failing: list[str] = []
+            # The true remainder BEHIND `failing` — every source `failing`
+            # is built from (the `tests` event, and the `test_results`
+            # fallback) is itself already bounded to `_MAX_PERSISTED_
+            # FAILING_TESTS` ids and carries its own `failing_tests_dropped`
+            # count; this method used to silently drop that count on the
+            # floor, so the next attempt's prompt presented 200 ids as if
+            # they were the WHOLE failing set on a run that actually had
+            # thousands more.
+            failing_dropped = 0
             try:
                 events = await self.store.list_events(task.id)
                 this_attempt: list[dict] = []
@@ -18516,6 +18621,8 @@ class Orchestrator:
                             continue
                         seen.add(tid)
                         failing.append(tid)
+                    failing_dropped = max(
+                        failing_dropped, int(ev.get("failing_tests_dropped") or 0))
             except Exception as exc:  # noqa: BLE001
                 self._advisory(f"prior-attempt test events read failed: {exc}")
             if not failing:
@@ -18527,6 +18634,7 @@ class Orchestrator:
                         tr = json.loads(tr) if tr else None
                     if isinstance(tr, dict):
                         failing = [str(t) for t in (tr.get("failing_tests") or [])]
+                        failing_dropped = int(tr.get("failing_tests_dropped") or 0)
                 except Exception as exc:  # noqa: BLE001
                     self._advisory(f"prior-attempt test_results fallback failed: {exc}")
 
@@ -18545,15 +18653,18 @@ class Orchestrator:
                     "source": source,
                     "findings": findings,
                     "failing_tests": failing,
+                    **({"failing_tests_dropped": failing_dropped} if failing_dropped else {}),
                 }
                 task.context = ctx
                 await self.store.update_task(task)
                 self.emit(
                     "prior_evidence_recorded",
                     f"attempt {attempt_n}: {len(findings)} blocking finding(s), "
-                    f"{len(failing)} failing test id(s) carried to the next attempt",
+                    f"{len(failing)} failing test id(s) carried to the next attempt"
+                    + (f" ({failing_dropped} more not carried)" if failing_dropped else ""),
                     findings=len(findings), failing_tests=len(failing),
                     attempt=attempt_n,
+                    **({"failing_tests_dropped": failing_dropped} if failing_dropped else {}),
                 )
             else:
                 # A clean attempt must never leave a PRIOR attempt's stale
@@ -23253,11 +23364,18 @@ SIX of them read a checkpoint and TWO do not — but do
                            for f in (test_evidence.get("failing_tests") or []) if f]
                 if failing:
                     k = len(failing)
-                    lines.append(f"<details><summary>{k} failing test"
-                                 f"{'s' if k != 1 else ''}</summary>\n")
+                    # `k` counts only the PERSISTED (bounded) ids — add back
+                    # `failing_tests_dropped` (ids truncated before this row
+                    # ever saw them) so `total` — used in BOTH the summary
+                    # header and the remainder count — stays honest instead
+                    # of the header advertising just the bounded `k`.
+                    dropped = int(test_evidence.get("failing_tests_dropped") or 0)
+                    total = k + dropped
+                    lines.append(f"<details><summary>{total} failing test"
+                                 f"{'s' if total != 1 else ''}</summary>\n")
                     lines += [f"- `{f}`" for f in failing[:10]]
-                    if k > 10:
-                        lines.append(f"- …and {k - 10} more")
+                    if total - 10 > 0:
+                        lines.append(f"- …and {total - 10} more")
                     lines.append("\n</details>")
             if test_evidence.get("invocation_error"):
                 # The counts above are real and stay. But the runner ALSO hit a

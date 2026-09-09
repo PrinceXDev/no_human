@@ -270,7 +270,10 @@ def build_prior_attempt_evidence(evidence: dict | None) -> str:
     # base check was inconclusive. "Newly-failing" would claim a comparison
     # this block never actually makes.
     kept_ids = list(failing_tests)
-    omitted_ids = 0
+    # The recorder already bounded the list and carried the true remainder
+    # as ``failing_tests_dropped``; start the "… and N more" count there so
+    # a 96,000-id run does not read as "and 65 more" after the word cap.
+    omitted_ids = int(evidence.get("failing_tests_dropped") or 0)
     test_ids_line = ""
     while True:
         if kept_ids:

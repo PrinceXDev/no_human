@@ -132,7 +132,10 @@ FROZEN_FUNCTION_LINES = {
     # serial re-run of only its failing files before being blamed on the
     # change (tasks ba602e95 / f8af7f46, 2026-09-08). Measured on this tree
     # with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 2212,
+    # 2212 -> 2220 (+8): 99fa5ba5 (bounded failing_tests and joins at
+    # every write site; the carried dropped count reaches the coder prompt)
+    # landed on top of cf6f6c19. Measured on this tree by the scanner's own metric.
+    "core/orchestrator.py:Orchestrator._run_attempt": 2220,
     # 760 -> 778 (+18): dispatch-time intake-eval hoisted path — the `elif
     # ctx.get("eval_result")` branch that acts on a grill/wizard-stored
     # verdict (idempotency marker, cost/residual-gap comments) added inside
@@ -310,7 +313,10 @@ FROZEN_FUNCTION_CC = {
     # 240 -> 243 (+3): the `_node_serial_rerun` call site's `if serial_passed:`
     # branch in the plain-red branch (tasks ba602e95 / f8af7f46, 2026-09-08).
     # Measured on this tree with the scanner below.
-    "core/orchestrator.py:Orchestrator._run_attempt": 243,
+    # 243 -> 247 (+4): 99fa5ba5 (bounded failing_tests and joins at
+    # every write site; the carried dropped count reaches the coder prompt)
+    # landed on top of cf6f6c19. Measured on this tree by the scanner's own metric.
+    "core/orchestrator.py:Orchestrator._run_attempt": 247,
     "core/orchestrator.py:Orchestrator._drive": 115,
     "agent/guard.py:_approve_denial": 81,
     # 73 -> 74 (+1): same cause as the LINES entry above — e922e9b4's landing
@@ -857,7 +863,10 @@ FROZEN_FILE_LINES = {
     # 23282 -> 23285 (+3): landing edits — the regenerate-nudge prompt says
     # "no usable manifest (missing or malformed)" and its once-guard is popped
     # at the attempt boundary like `_reformat_nudged`/`_report_nudged`.
-    "core/orchestrator.py": 23285,
+    # 23285 -> 23403 (+118): 99fa5ba5 (bounded failing_tests and joins at
+    # every write site; the carried dropped count reaches the coder prompt)
+    # landed on top of cf6f6c19. Measured on this tree by the scanner's own metric.
+    "core/orchestrator.py": 23403,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
