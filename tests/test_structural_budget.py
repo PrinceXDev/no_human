@@ -836,7 +836,11 @@ FROZEN_FILE_LINES = {
     # branch — one serial re-run of only the failing files before a cold
     # `node --test` run is blamed on the change (tasks ba602e95 / f8af7f46,
     # 2026-09-08). Measured on this tree by the scanner's own metric.
-    "core/orchestrator.py": 23117,
+    # 23117 -> 23153 (+36): the base-refresh divergence advisory and its
+    # `diverged` record in `_refresh_stale_base` (task e83b0b6d), landed on
+    # top of a9db9cba's 23117. Measured on this tree by the scanner's own
+    # metric.
+    "core/orchestrator.py": 23153,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.
