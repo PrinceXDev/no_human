@@ -80,22 +80,48 @@ match the changed files and puts each one, independently, to a fresh
 bounded judge call (max one turn) with the diff and read-only file access.
 Every verdict is recorded — pass or fail, with `evidence`, `file`/`line`
 when it names one, and which files it actually checked — never only the
-failures. A verifier that returns no parseable verdict (a timeout, a crash,
-an unparseable response) fails closed, the same posture as the agentic
-reviewer itself.
+failures. A verifier judge that reaches no parseable verdict (a timeout, a
+crash, an unparseable response) gets exactly one bounded retry. If the retry
+*also* reaches no verdict, the outcome is recorded as `no_verdict`/
+`unavailable` on that verifier's result — it is **advisory only**: it never
+causes the round to fail or escalate on its own, it is reported as one
+advisory log line and as a `⚠️` item in the PR Evidence table's per-rule
+fold, and the round proceeds to the agentic reviewer. (The Evidence table's
+`Verifiers` ROW is `⚠️` only when nothing else failed; a round that also
+carries a genuine FAIL keeps a `❌` row, because the row summarises the whole
+set.) On a round where no *other* verifier answered FAIL, it does not add
+a `rule:<verifier id>` item to the reviewer's
+checklist at all — `_run_review` does not escalate the task or end the
+attempt, and the round proceeds to the agentic reviewer exactly as it would
+if every verifier had passed. On a round where another verifier *does*
+answer FAIL, the unavailable one still rides along on that failing round's
+own checklist (at advisory/`low` severity, per `to_checklist_item`) so it
+stays visible rather than silently disappearing — it just never fails the
+round by itself. A verifier that never reaches a verdict is an
+infrastructure gap in the gate, not evidence about the change, so it must
+never be charged to the coder as a defect nobody found — merge-policy's
+`verifiers_all_satisfied` check treats an unavailable-only round as ready,
+naming the unavailable verifiers in its detail rather than blocking on them.
 
-The merge into the review decision is monotonic, not advisory noise the
-reviewer can talk itself past: **any** failing verifier ends the round
-before the agentic reviewer ever runs, appearing on the checklist as
-`rule:<verifier id>`. Only when every selected verifier is satisfied does the
-round proceed to the reviewer, and its own findings still apply on top. Every
-verifier verdict is persisted on the attempt row (`attempts.verifier_results`)
+The merge into the review decision is monotonic for **answered** verdicts,
+not advisory noise the reviewer can talk itself past: **any** verifier that
+*answers* FAIL ends the round before the agentic reviewer ever runs,
+appearing on the checklist as `rule:<verifier id>`. Only a genuine FAIL
+short-circuits the round this way — a no-verdict-after-retry outcome does
+not, even when it is the only failing result that round. Every verifier
+verdict is persisted on the attempt row (`attempts.verifier_results`)
 and keyed into `task.context.verifier_results` by the commit SHA it judged,
 so a later attempt's verdicts never overwrite an earlier one's. The same
-verdicts render twice for a human: as a `Verifiers` row in the PR body's
-Evidence table (`core/pr_evidence.py`'s `verifiers_pin()` — `"N of N
-satisfied"` or `"K of N failed — id1, id2"`, folded behind a `<details>` list
-of every rule), and as a per-verifier list in the board's Review tab. No
+verdicts are rendered for a human in more than one place: as a `Verifiers`
+row in the PR body's Evidence table (`core/pr_evidence.py`'s `verifiers_pin()` — `"N of N
+satisfied"`, `"K of N failed — id1, id2"`, or, when one or more reached no
+verdict, a variant naming them separately as `"no verdict (advisory)"` rather
+than folding them into the failed count, folded behind a `<details>` list
+of every rule), and as a per-verifier list in the board's Review tab.
+`nh verifiers list` and `nh approve --ready` surface the same distinction on
+the command line; the evidence ledger's `verifiers.md` is not a rendering at
+all — it dumps the stored result objects verbatim, so it shows the raw
+`unavailable` flag rather than a glyph. No
 `.no_human/verifiers.yaml` (repo or global), verifiers disabled in config, no
 usable diff, or a changed-path set that matches none of the loaded rules all
 skip the step entirely and proceed straight to the agentic reviewer — this is
@@ -111,8 +137,12 @@ none of its subcommands make a model call, a network call, or construct an
 `run_verifiers`.
 
 - `nh verifiers list [--repo] [--json]` — prints every configured verifier
-  (repo + global, repo wins on id collision) and any load problems. Always
-  exits 0; it is a read-only inspection command.
+  (repo + global, repo wins on id collision) and any load problems, plus a
+  `runs` / `no verdict` count per verifier (`no_verdict_count` in `--json`)
+  aggregated read-only from every persisted attempt's `verifier_results`, so
+  an operator can spot a verifier that never answers. Always exits 0 — a
+  missing or unreadable DB degrades the counts to zero rather than failing;
+  it is a read-only inspection command.
 - `nh verifiers add --id ID --statement TEXT --path GLOB [--path GLOB ...]
   [--severity high] [--repo] [--global/-g]` — additively defines a new
   verifier. It never rewrites the whole YAML file, only appends the new

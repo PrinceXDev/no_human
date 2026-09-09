@@ -27,19 +27,28 @@ result is persisted onto the attempt (``attempts.verifier_results``) and the
 task's context, keyed by the reviewed commit sha. A genuinely failing
 verifier ends the round with a failing ``ReviewDecision`` — built via
 ``to_checklist_item`` — without the agentic reviewer ever running; a round
-whose only failures are ``unavailable`` raises ``ReviewerUnavailable``
-instead, so it escalates rather than reads as a coder-facing finding.
+whose only failures are ``unavailable`` is advisory: it is reported via one
+``verifiers_unavailable`` event and the round continues to the agentic
+reviewer exactly as it would for an all-pass round, since a verifier that
+cannot answer is an infrastructure gap in the gate, not evidence about the
+change.
 
 A ``no_verdict`` result gets exactly ONE bounded retry (mirroring
 ``reviewer.py``'s own retry-then-``ReviewerUnavailable`` pattern rather than
 inventing a second policy). If the retry also reaches no verdict, the
 result is additionally marked ``unavailable=True``: the caller
-(``orchestrator.py``'s ``_run_review``) must treat that as an infra/config
-signal to escalate, NEVER as a coder-facing high-severity finding — the
-verdict still renders as "not satisfied" (fail-closed is unchanged), but it
-must not be billed to the coder as a defect nobody found. See
+(``orchestrator.py``'s ``_run_review``) treats that as an infra/config
+signal that is advisory only, NEVER as a coder-facing high-severity finding
+and NEVER as a reason to escalate or end the attempt — the result still
+carries ``passed=False``, so fail-closed is unchanged at the data level.
+The property the consumers hold to is that nothing which renders a VERDICT
+may fold this outcome into "failed": wherever a verdict is shown it is named
+as its own third state, and the raw record (the ``verifier_results`` column,
+and anything that dumps it verbatim such as the evidence ledger) carries
+``unavailable=True`` beside ``passed=False`` for a reader to interpret. It
+is never billed to the coder as a defect nobody found. See
 ``_classify_unavailable`` for the transport-failure vs. malformed-response
-distinction used to word the escalation message. A judge failure whose text
+distinction used to word that advisory line. A judge failure whose text
 carries a subscription usage-limit signal (``core.bounds.quota_signal``) is
 a DIFFERENT case again: it is not a no-verdict at all, and ``_judge_once``
 re-raises it as ``QuotaExhausted`` so the round parks the task instead of
@@ -118,11 +127,13 @@ class VerifierResult:
     no_verdict: bool = False
     # True only when a `no_verdict` result survived the one bounded retry
     # `run_verifiers` gives it. This is the infra/config signal: the round
-    # must escalate (`ReviewerUnavailable`), never fail closed as a coder
-    # finding — the exact anti-pattern `reviewer.py`'s docstring names. The
-    # pre-existing "no matching hunks in the diff" no_verdict case never
-    # calls the judge at all, so it can never become `unavailable`: retrying
-    # a deterministic diff-filter result would not change the outcome.
+    # records it as advisory and CONTINUES to the agentic reviewer, never
+    # fails closed as a coder finding — the exact anti-pattern
+    # `reviewer.py`'s docstring names. A verifier that cannot answer is not
+    # evidence about the change. The pre-existing "no matching hunks in the
+    # diff" no_verdict case never calls the judge at all, so it can never
+    # become `unavailable`: retrying a deterministic diff-filter result
+    # would not change the outcome, and it still fails the round closed.
     unavailable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -540,7 +551,8 @@ def to_checklist_item(result: VerifierResult) -> ChecklistItem:
         # judge is an infra/config signal, not a review finding, so it is
         # advisory severity — it still renders as not-passed (never "OK"),
         # it just does not block on its own. The caller (orchestrator) is
-        # what actually escalates this round instead of failing it.
+        # what actually lets the round continue to the agentic reviewer
+        # instead of failing it.
         severity = "low"
     elif result.no_verdict:
         severity = "high"
@@ -693,7 +705,8 @@ async def run_verifiers(
         if result.no_verdict:
             # One bounded retry, mirroring reviewer.py's ReviewerUnavailable
             # shape: a single no-verdict judge call is not yet a finding, it
-            # might just be a hiccup. Only a SECOND no-verdict escalates.
+            # might just be a hiccup. Only a SECOND no-verdict marks the
+            # result unavailable — which is advisory, not an escalation.
             retry_result = await _judge_once(retry, prompt, verifier, files_checked)
             retry_result.tokens_used += result.tokens_used
             if retry_result.no_verdict:
@@ -705,10 +718,24 @@ async def run_verifiers(
 
 
 def summary_line(results: list[VerifierResult]) -> str:
+    """Mirrors `core/pr_evidence.py`'s `verifiers_pin()` wording exactly: an
+    unavailable (no-verdict-after-retry) verifier is its own advisory third
+    state, never folded into "failed" — a mixed round with one genuine
+    failure and one unavailable rule must not read as "2 of 2 failed"."""
     if not results:
         return ""
     total = len(results)
-    failed = sorted(r.verifier_id for r in results if not r.passed)
-    if not failed:
+    failed = sorted(r.verifier_id for r in results if not r.passed and not r.unavailable)
+    unavailable = sorted(r.verifier_id for r in results if r.unavailable)
+    if not failed and not unavailable:
         return f"{total} of {total} satisfied"
-    return f"{len(failed)} of {total} failed — {', '.join(failed)}"
+    if failed:
+        line = f"{len(failed)} of {total} failed — {', '.join(failed)}"
+        if unavailable:
+            line += f"; {len(unavailable)} no verdict (advisory) — {', '.join(unavailable)}"
+        return line
+    checked = total - len(unavailable)
+    return (
+        f"{checked} of {total} satisfied, {len(unavailable)} no verdict "
+        f"(advisory) — {', '.join(unavailable)}"
+    )

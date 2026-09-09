@@ -131,7 +131,8 @@ _RULES = [
 
 
 def _ready_task(db, tmp_path, *, title, repo_name, review_passed=True,
-                 mp_ready=True, mp_policy_changed=False, mp_sha=None):
+                 mp_ready=True, mp_policy_changed=False, mp_sha=None,
+                 rules=None):
     """An AWAITING_APPROVAL task with a real local feature branch, a
     `pr_watch`/`pr_branch` pair (all `resolve_task_pr` needs — no PR event
     log required), a `merge_policy` verdict, and a `review_history` round
@@ -150,7 +151,7 @@ def _ready_task(db, tmp_path, *, title, repo_name, review_passed=True,
                     verdict_sha: {
                         "ready": mp_ready,
                         "policy_changed_in_diff": mp_policy_changed,
-                        "rules": [dict(r) for r in _RULES],
+                        "rules": [dict(r) for r in (rules or _RULES)],
                     },
                 },
                 "review_history": [{"sha": head_sha, "passed": review_passed}],
@@ -425,3 +426,54 @@ def test_status_prints_merge_ready_count(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "merge-ready: 1" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# the advisory note on the one-line --ready summary                           #
+# --------------------------------------------------------------------------- #
+# A verifier that never reached a verdict leaves the task READY — the rule
+# passes — so `rules N/N` alone tells the operator nothing happened, when in
+# fact a verifier never answered. The detail text is not restated here: it is
+# produced by the shipped `_check_verifiers_all_satisfied` from real GateFacts,
+# so a change to that wording breaks this test instead of silently escaping it.
+
+def _verifiers_rule(*, unavailable: tuple[str, ...]) -> dict:
+    from no_human.core.merge_policy import GateFacts, _check_verifiers_all_satisfied
+    facts = GateFacts(review_passed=True, verifiers_ran=3, verifiers_failed=(),
+                      verifiers_unavailable=unavailable)
+    passed, detail = _check_verifiers_all_satisfied(facts, None)
+    return {"name": "verifiers_all_satisfied", "passed": passed, "detail": detail}
+
+
+def test_ready_line_names_a_verifier_that_never_answered(tmp_path, monkeypatch):
+    db = tmp_path / "nh.db"
+    monkeypatch.setattr(approve_merge_mod, "land_task", _never_called_land_task)
+
+    rules = [dict(_RULES[0]), _verifiers_rule(unavailable=("no-todo", "no-print"))]
+    task_id, _, _ = _ready_task(db, tmp_path, title="Task A", repo_name="repo-a",
+                                rules=rules)
+
+    result = _invoke(approve, db, ["--ready"])
+
+    assert result.exit_code == 0, result.output
+    assert task_id[:8] in result.output
+    assert "rules 2/2" in result.output
+    # The whole parenthetical, both verifier ids, on the same line as the task.
+    line = next(ln for ln in result.output.splitlines() if task_id[:8] in ln)
+    assert "2 no verdict (advisory): no-todo, no-print" in line, line
+
+
+def test_ready_line_carries_no_note_when_every_verifier_answered(tmp_path, monkeypatch):
+    db = tmp_path / "nh.db"
+    monkeypatch.setattr(approve_merge_mod, "land_task", _never_called_land_task)
+
+    rules = [dict(_RULES[0]), _verifiers_rule(unavailable=())]
+    task_id, _, _ = _ready_task(db, tmp_path, title="Task A", repo_name="repo-a",
+                                rules=rules)
+
+    result = _invoke(approve, db, ["--ready"])
+
+    assert result.exit_code == 0, result.output
+    line = next(ln for ln in result.output.splitlines() if task_id[:8] in ln)
+    assert "no verdict" not in line, line
+    assert "rules 2/2" in line, line

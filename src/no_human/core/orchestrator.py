@@ -94,6 +94,7 @@ from ..review.reviewer import (
     AdversarialReviewer,
     ReviewDecision,
     ReviewerUnavailable,
+    _carry_usage,
     findings_from_checklist,
 )
 from ..review.selfcheck import ChecklistItem
@@ -14041,13 +14042,13 @@ class Orchestrator:
 
         failed_verifiers = [r for r in verifier_results if not r.passed]
         # A verifier that is STILL no_verdict after `run_verifiers`'s one
-        # bounded retry (`r.unavailable`) is an infra/config signal, not a
-        # review finding — the exact anti-pattern reviewer.py's
-        # `ReviewerUnavailable` exists to stop: charging the coder an attempt
-        # for a defect nobody found. Split it out from genuine failures so a
-        # round that ALSO has a real violation still fails on that violation
-        # (never silently dropped just because another rule was unavailable),
-        # and a round with ONLY unavailable rules escalates instead.
+        # bounded retry (`r.unavailable`) is an infra gap in the gate, not
+        # evidence about the change — it never escalates the task or ends the
+        # attempt. Split it out from genuine failures so a round that ALSO has
+        # a real violation still fails on that violation (never silently
+        # dropped just because another rule was unavailable), and a round
+        # with ONLY unavailable rules is recorded and reported, then
+        # continues to the agentic reviewer like any other passing gate.
         genuinely_failed = [r for r in failed_verifiers if not r.unavailable]
         unavailable_verifiers = [r for r in failed_verifiers if r.unavailable]
         if genuinely_failed:
@@ -14084,21 +14085,15 @@ class Orchestrator:
             self._emit_review(
                 "verifiers_unavailable",
                 f"{len(unavailable_verifiers)} verifier(s) reached no verdict "
-                f"after a bounded retry, and no other verifier this round "
-                f"failed: {names}",
+                f"after a bounded retry — advisory, the review continues: "
+                f"{names}",
                 advisory=True,
             )
-            exc = ReviewerUnavailable(
-                f"{len(unavailable_verifiers)} verifier(s) reached no verdict "
-                f"after a bounded retry, and none of the other verifiers this "
-                f"round failed: {names}. Escalating instead of charging the "
-                "coder for a defect nobody found."
-            )
-            exc.tokens_used = verifier_tok["total"]
-            exc.cache_read_tokens = verifier_tok["cache_read"]
-            exc.cache_creation_tokens = verifier_tok["cache_creation"]
-            exc.output_tokens = verifier_tok["output"] if verifier_output_seen else None
-            raise exc
+            # No raise: a verifier that cannot answer is an infrastructure gap
+            # in the gate, not evidence about the change. The outcome is
+            # already persisted in `verifier_dicts` (above) and reported via
+            # the event just emitted; execution falls through to the agentic
+            # reviewer exactly as it would for an all-pass round.
 
         self._emit_review("review_start", "running independent staff-level reviewer")
         try:
@@ -14123,10 +14118,14 @@ class Orchestrator:
                 failing_test_ids=pre_review_failing_ids,
                 failing_test_ids_dropped=pre_review_ids_dropped,
             )
-        except ReviewerUnavailable:
-            # The gate could not run. Escalate (the caller's handler) rather than
-            # returning a failing decision, whose checklist would be fed to the
-            # coder as a finding to fix and would spend one of its attempts.
+        except ReviewerUnavailable as exc:
+            # Escalate, but fold the verifiers' already-spent tokens onto exc
+            # first — spent even though the reviewer is ALSO unavailable.
+            from types import SimpleNamespace
+            _carry_usage(exc, [SimpleNamespace(
+                tokens_used=verifier_tok["total"], cache_read_tokens=verifier_tok["cache_read"],
+                cache_creation_tokens=verifier_tok["cache_creation"],
+                output_tokens=verifier_tok["output"] if verifier_output_seen else None)])
             raise
         except Exception as exc:  # noqa: BLE001
             # Reviewer crash → fail closed (never pass-through on error).
@@ -14143,10 +14142,11 @@ class Orchestrator:
                 output_tokens=(verifier_tok["output"] if verifier_output_seen else None),
             )
 
-        # Fold verifiers into the round the reviewer actually judged: the
-        # gate already passed them (a failure would have returned above,
-        # before the reviewer ever ran), so this is purely additive
-        # record-keeping — see `ReviewDecision.verifiers`'s docstring.
+        # Fold verifiers into the round the reviewer actually judged: every
+        # verifier either passed or was advisory (a *genuine* failure would
+        # have returned above, before the reviewer ever ran), so this is
+        # purely additive record-keeping — see `ReviewDecision.verifiers`'s
+        # docstring.
         # `_record_review_usage` (:6243) is a SET the CALLER runs once this
         # function returns — folding here, not a second DB write, is what
         # keeps reviewer + verifier spend from clobbering each other.

@@ -205,6 +205,52 @@ def verifiers_group() -> None:
     (`.no_human/verifiers.yaml`) — never calls a model."""
 
 
+async def _no_verdict_counts(db_path) -> dict[str, dict[str, int]]:
+    """{verifier_id: {"runs": int, "no_verdict": int}} over every persisted
+    attempt's verifier_results. Read-only; never writes.
+
+    A verifier that never reaches a verdict (an infra gap in the gate, see
+    `review/verifiers.py`) is advisory at review time — it never fails or
+    escalates a round — but an operator still needs to see WHICH verifier is
+    the one never answering, so `nh verifiers list` surfaces the count here
+    rather than requiring a DB query.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    try:
+        async with Store(db_path) as store:
+            grouped = await store.attempts_by_task()
+    except Exception:  # noqa: BLE001 — a missing/locked DB must not break `list`
+        return counts
+    for attempts in grouped.values():
+        for attempt in attempts:
+            raw = attempt.get("verifier_results")
+            if not raw:
+                continue
+            try:
+                results = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(results, list):
+                continue
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                vid = r.get("verifier_id")
+                if not vid:
+                    continue
+                entry = counts.setdefault(vid, {"runs": 0, "no_verdict": 0})
+                entry["runs"] += 1
+                # `unavailable`, not `no_verdict`: `no_verdict` alone is also
+                # set by the deterministic "no matching hunks in the diff"
+                # case, where no judge call is ever made — a verifier that
+                # was never asked did not fail to answer. `unavailable` is
+                # only set once a no-verdict result survives the bounded
+                # retry, i.e. the judge WAS asked and still never answered.
+                if r.get("unavailable"):
+                    entry["no_verdict"] += 1
+    return counts
+
+
 @verifiers_group.command("list")
 @click.option("--repo", default=".", type=click.Path(), help="Repo root to read verifiers.yaml from.")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
@@ -213,6 +259,14 @@ def list_cmd(repo: str, as_json: bool) -> None:
     problems. Always exits 0 — this is a read-only inspection command."""
     repo_root = Path(repo).resolve()
     report = load_verifiers(repo_root, home=NO_HUMAN_HOME)
+
+    try:
+        counts = asyncio.run(_no_verdict_counts(load_config().db_path))
+    except Exception:  # noqa: BLE001 — advisory only, `list` must still exit 0
+        counts = {}
+
+    def _counts_for(v_id: str) -> dict[str, int]:
+        return counts.get(v_id, {"runs": 0, "no_verdict": 0})
 
     if as_json:
         _mark_machine_output()
@@ -225,6 +279,8 @@ def list_cmd(repo: str, as_json: bool) -> None:
                     "severity": v.severity,
                     "source": v.source,
                     "source_file": v.source_file,
+                    "runs": _counts_for(v.id)["runs"],
+                    "no_verdict_count": _counts_for(v.id)["no_verdict"],
                 }
                 for v in report.verifiers
             ],
@@ -243,8 +299,11 @@ def list_cmd(repo: str, as_json: bool) -> None:
     table.add_column("severity")
     table.add_column("paths")
     table.add_column("source")
+    table.add_column("runs")
+    table.add_column("no verdict")
     for v in report.verifiers:
-        table.add_row(v.id, v.severity, ", ".join(v.paths), v.source)
+        c = _counts_for(v.id)
+        table.add_row(v.id, v.severity, ", ".join(v.paths), v.source, str(c["runs"]), str(c["no_verdict"]))
     console.print(table)
 
 
