@@ -67,9 +67,10 @@ somebody attacked this and won.
 
 The boundaries, as currently understood:
 
-  * **The coder agent's own Bash.** The backend runs with
-    `permission_mode="bypassPermissions"` and no tool allowlist. A `curl` an
-    agent decides to run passes through no code this file parses. That traffic
+  * **The coder agent's own Bash.** The backend runs
+    `permission_mode="bypassPermissions"` by default, and its one alternative
+    (`llm.permission_mode: acceptEdits`) pre-approves `Bash` — so under either,
+    a `curl` an agent decides to run passes through no code this file parses. That traffic
     is unbounded and no static check bounds it. `docs/security.md` §7 says so
     in the same words.
   * **Dependencies.** `httpx`, the Agent SDK, Electron and everything in

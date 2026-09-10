@@ -538,7 +538,7 @@ def make_backend(
     role: str = "coder",
     forbidden_paths: list[str] | None = None,
     never_push_to: list[str] | None = None,
-    permission_mode: str = "bypassPermissions",
+    permission_mode: str | None = None,
     readonly: bool = False,
     supervisor_hook: "SupervisorHook | None" = None,
     lint_hook: Any | None = None,
@@ -559,6 +559,19 @@ def make_backend(
     directly, with identical arguments. An operator who changes nothing sees
     no behavioural difference.
     """
+    # `None` means "read `llm.permission_mode`" (default `bypassPermissions`,
+    # so an operator who sets nothing sees no change); an explicit argument
+    # still wins, which is the seam the tests construct through. Resolved once
+    # here rather than in each backend branch so the coder and the reviewer —
+    # the only two production call sites, both of which pass `config=` — get
+    # the same answer. The reviewer needs it as much as the coder does: it
+    # runs the suite through Bash.
+    if permission_mode is None:
+        # Aliased: the parameter and the resolver share a name. Imported here
+        # like every other `..config` use in this module — the package imports
+        # this one back.
+        from ..config import permission_mode as config_permission_mode
+        permission_mode = config_permission_mode(config or {})
     entry = None
     if role != "coder":
         # The pin is the FACTORY's, not the caller's: an explicit `backend=`

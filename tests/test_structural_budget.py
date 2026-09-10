@@ -1619,7 +1619,7 @@ FROZEN_FILE_LINES = {
     # probe `nh start`/the API lifespan use to detect a missing credential
     # without triggering the scrub. Measured on this tree with the scanner
     # below.
-    "config.py": 3596,
+    "config.py": 3646,
     # +61: the tamper-adjudication one-bounded-retry contract (mechanical-
     # failure classification + the extracted `_review_tamper_adjudication`
     # helper that keeps `AdversarialReviewer.review` itself under the

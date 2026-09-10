@@ -102,11 +102,28 @@ or escalates with a structured report (see [blockers.md](blockers.md)).
 
 **Read this first: no_human is not an offline tool, and this page does not claim
 to be an exhaustive list of its network traffic.** It cannot be one. The coder
-session is a Claude Agent SDK session built with **no tool restrictions** and
+session is a Claude Agent SDK session that by default runs
 `permission_mode="bypassPermissions"`
-(`agent/claude_backend.py:ClaudeBackend.__init__:520`, `:ClaudeBackend.__init__:545`) —
-no tool allowlist, no tool denylist, no per-call permission callback. It has
-Bash. Anything an agent decides to run — `curl`, `pip install`, `npm i`, a test
+(`agent/claude_backend.py:ClaudeBackend.__init__:540`, `:ClaudeBackend.__init__:565`):
+the CLI approves every tool call, no tool denylist is set, and no per-call
+permission callback runs.
+
+An operator whose organisation disables that mode can set
+`llm.permission_mode: "acceptEdits"`, which pre-approves `Bash`
+(`agent/claude_backend.py:PRE_APPROVED_TOOLS`). That key reaches the coder and
+the reviewer only; every other session keeps the default, and
+`docs/configuration.md` lists which. Under that mode a tool which is not
+pre-approved and would otherwise prompt is refused rather than run — a NARROWER
+surface than the default, not an equal one, so this section describes the widest
+configuration rather than every one.
+
+Do not read either mode as "no allowlist is ever sent". A session that carries
+a skill passes one already: the SDK folds skills into the same argument, so a
+coder run carrying a skill named `X` emits `--allowedTools Skill(X)` under the
+default mode and `--allowedTools Bash,Skill(X)` under the other. What holds in
+every case, and what the rest of this section actually rests on, is that the
+session has Bash. Anything an agent decides to run — `curl`, `pip install`,
+`npm i`, a test
 suite that hits a staging API — leaves your machine, and nothing in no_human sits
 between it and the network. An exhaustive egress claim cannot survive that, so
 this page does not make one. If that is unacceptable for your codebase, the

@@ -507,6 +507,26 @@ def _make_compact_hook(on_compact: Callable[[str], None]) -> Callable[..., Await
 # result or resume replay, still a bound (a runaway line cannot eat memory).
 SDK_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
+# Tools to pre-approve when the session is NOT running `bypassPermissions`.
+# That mode approves everything by itself, so this list is dead weight there
+# and is not sent; `acceptEdits` is the mode that needs it.
+#
+# MEASURED against CLI 2.1.267 on 2026-09-10, not reasoned: under `acceptEdits`
+# the CLI auto-approves the edit tools and never prompts for the read-only
+# ones, so `Bash` is the only class that stops an unattended run — `git init`
+# comes back "Command requires approval to run `git init`" with no allowlist
+# and succeeds with one.
+#
+# Bash ALONE is listed. What that means is established; what it means for any
+# OTHER tool is not measured here and is deliberately not claimed. Under
+# `bypassPermissions` the CLI approves everything, so this mode is narrower by
+# construction for any tool that would otherwise prompt. Widening the list is
+# not the way to close that: `docs/security.md` §7 accounts for the coder's
+# Bash egress and for nothing else, and an allowlist is the wrong place to
+# widen a security disclosure quietly. A tool left out is not silently
+# disabled — it surfaces as a visible blocker naming the approval it wanted.
+PRE_APPROVED_TOOLS = ("Bash",)
+
 
 class ClaudeBackend:
     """Drives one Agent SDK session per call to :meth:`run`."""
@@ -738,6 +758,16 @@ class ClaudeBackend:
         kwargs["setting_sources"] = [] if (self.readonly and not skills) else ["project"]
         if self.tools is not None:
             kwargs["tools"] = self.tools
+        # `tools == []` is the advisory seam deliberately shipping NO tool
+        # schema (a measured 38.5M tok/week). Skipped there because an
+        # allowlist over a session that holds no tools is meaningless, NOT
+        # because it would undo the saving: `--tools` and `--allowedTools`
+        # are separate flags (availability vs permission), and setting the
+        # second cannot repopulate the first. Measured, both flags at once:
+        # `tools=[]` emits `--tools ''` and no `--allowedTools`; `tools=None`
+        # emits `--allowedTools Bash` and no `--tools`.
+        if self.permission_mode != "bypassPermissions" and self.tools != []:
+            kwargs["allowed_tools"] = list(PRE_APPROVED_TOOLS)
         if self.system_prompt is not None:
             kwargs["system_prompt"] = self.system_prompt
         return ClaudeAgentOptions(

@@ -560,3 +560,73 @@ async def test_no_output_format_leaves_option_unset(fake_query, tmp_path):
     backend = ClaudeBackend(model="claude-sonnet-5")
     await backend.run("p", cwd=tmp_path, max_turns=2)
     assert fake_query.options.output_format is None
+
+
+def test_permission_mode_defaults_to_bypass_and_never_falls_back_silently():
+    """The default is the shipped behaviour; anything unrecognised is loud.
+
+    The empty cases are the point. This key exists because a silent fallback
+    reproduces the exact failure it cures — the default is the mode a
+    policy-bound organisation disables, so an operator who wrote the key and
+    left it blank must not be handed that mode back without a word. ABSENT is
+    the only spelling that means "use the default".
+    """
+    from no_human.config import AuthError, PERMISSION_MODES, permission_mode
+
+    assert permission_mode({}) == "bypassPermissions"
+    assert permission_mode({"llm": {}}) == "bypassPermissions"
+    assert permission_mode(
+        {"llm": {"permission_mode": "acceptEdits"}}) == "acceptEdits"
+
+    for blank in ("", None, "   "):
+        with pytest.raises(AuthError):
+            permission_mode({"llm": {"permission_mode": blank}})
+
+    # Case-sensitive on purpose: the SDK spellings are camelCase.
+    with pytest.raises(AuthError) as exc:
+        permission_mode({"llm": {"permission_mode": "acceptedits"}})
+    for legal in PERMISSION_MODES:
+        assert legal in str(exc.value)
+
+
+def test_the_tool_allowlist_is_sent_only_when_the_mode_needs_it(tmp_path):
+    """`bypassPermissions` approves every tool itself, so an allowlist is dead
+    weight there and is not sent.
+
+    The `tools == []` row is the advisory seam, which ships no tool schema at
+    all. It is skipped because an allowlist over a session holding no tools is
+    meaningless — NOT because an allowlist could undo that saving; `--tools`
+    and `--allowedTools` are separate flags and the second cannot repopulate
+    the first.
+    """
+    from no_human.agent.claude_backend import PRE_APPROVED_TOOLS
+
+    def allowed(mode, tools=None):
+        opts = ClaudeBackend(model="m", permission_mode=mode,
+                             tools=tools)._options(tmp_path, 5)
+        return list(getattr(opts, "allowed_tools", []) or [])
+
+    assert allowed("bypassPermissions") == []
+    assert allowed("bypassPermissions", ["Read"]) == []
+    assert allowed("acceptEdits") == list(PRE_APPROVED_TOOLS)
+    assert allowed("acceptEdits", ["Read"]) == list(PRE_APPROVED_TOOLS)
+    assert allowed("acceptEdits", []) == []
+
+
+def test_make_backend_reads_the_mode_from_config_and_an_argument_still_wins():
+    """Resolved inside the factory, so both production call sites get it.
+
+    `core/runtime.py` (coder) and `review/reviewer.py` (reviewer) are the two,
+    and both pass `config=`. The reviewer needs this as much as the coder: it
+    runs the test suite through Bash.
+    """
+    from no_human.agent.backend import make_backend
+
+    assert make_backend(
+        model="m", config={}).permission_mode == "bypassPermissions"
+    assert make_backend(
+        model="m", config={"llm": {"permission_mode": "acceptEdits"}},
+    ).permission_mode == "acceptEdits"
+    assert make_backend(
+        model="m", config={}, permission_mode="acceptEdits",
+    ).permission_mode == "acceptEdits"
