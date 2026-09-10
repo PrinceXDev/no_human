@@ -928,6 +928,23 @@ def test_wrong_shaped_manifest_is_named_not_called_missing(tmp_path):
 @pytest.mark.parametrize("content", [
     b"\xff\xfe not utf8", b"{not json", b"[]", b'{"repro_tests": []}',
     b'{"tests": []}', b'{"tests": [" "]}', b'{"tests": ["tests/t.py::t"]}',
+    # ad32398b: per-test dicts under the correct key, and other odd shapes.
+    b'{"tests": [{"id": "tests/t.py::t"}]}',
+    b'{"tests": [{"id": "tests/t.py::t", "why": "explains it"}]}',
+    b'{"tests": [{"test": "tests/t.py::t"}]}',
+    b'{"tests": [{"id": 5}]}',
+    b'{"tests": [7]}',
+    b'{"tests": [null]}',
+    b'{"tests": [["tests/t.py::t"]]}',
+    b'{"tests": ["a.py::t", {"id": "b.py::t"}]}',
+    # Whole-file scalars. Absence must be carried by something NO document can
+    # decode to. These four are the wiring check — each is a value CPython
+    # happens to return as the SAME object every time, so a loader using it as
+    # its absence sentinel calls a present file missing, the same failure class
+    # as 89db42ea. They are not the property, and enumerating values cannot be:
+    # `test_absence_sentinel_is_not_a_decodable_type` below pins it over the
+    # decoded TYPE instead, which is a closed set where the values are not.
+    b"null", b'""', b"0", b"false",
 ])
 def test_manifest_problem_and_read_manifest_agree(tmp_path, content):
     """Two readers of one file: `read_manifest` (the gate's input) and
@@ -940,3 +957,142 @@ def test_manifest_problem_and_read_manifest_agree(tmp_path, content):
     tests = read_manifest(tmp_path)
     problem = manifest_problem(tmp_path)
     assert (tests == []) == (problem is not None)
+    if problem is None:
+        raw = content.decode(errors="replace")
+        for test_id in tests:
+            assert test_id in raw, (test_id, raw)
+
+
+def test_absence_sentinel_is_not_a_decodable_type():
+    """The property the SENTINEL rests on: absence is carried by something no
+    document can decode to. (The change as a whole rests principally on
+    `_entry_id`; this is the narrower guard the centralised read made
+    necessary.)
+
+    Enumerating VALUES cannot express that. CPython returns the same object for
+    `None`, `True`, `False`, every int in [-5, 256], the empty string and
+    single-character latin-1 strings, so a sentinel of `True`, `1`, `"a"` or `-5` is
+    exactly as broken as `None` and a value list will always miss one — four
+    were listed above and `True`, `1`, `"a"` and `-5` all still slipped
+    through.
+
+    The decoded TYPE set is closed, so assert over that instead: whatever
+    `json.loads` can produce, `_ABSENT` must not be one of them. This admits a
+    custom sentinel class and rejects every literal, without naming any.
+    """
+    import json
+
+    from no_human.testing.repro_gate import _ABSENT
+
+    decodable = {type(json.loads(s)) for s in (
+        "null", "true", "false", "0", "-5", "1.5", '"a"', "[]", "{}",
+    )}
+    assert decodable == {type(None), bool, int, float, str, list, dict}, decodable
+    assert not isinstance(_ABSENT, tuple(decodable)), (
+        f"_ABSENT is a {type(_ABSENT).__name__}, which a manifest could decode to"
+    )
+
+
+def test_a_null_manifest_is_named_not_reported_as_absent(tmp_path):
+    """A present file containing `null` must be described by its SHAPE, never
+    as an absent manifest.
+
+    `json.loads("null")` is `None`, so absence cannot be carried by `None`
+    once the read is centralised: the loader returns a dedicated sentinel
+    instead. Without that sentinel THIS refactor would make the file
+    indistinguishable from no file at all and tell the coder there was no
+    manifest while one sat in the tree — the same shape as 89db42ea, which
+    `manifest_problem`'s docstring records (that one was a manifest keyed
+    `repro_tests`, a wrong top-level KEY rather than a whole-file scalar).
+    It is a guard against a hazard this change introduces, not a bug that
+    shipped: on the parent commit each caller did its own `is_file()` check,
+    so a whole-file scalar never reached an absence test, and this test passes
+    there unchanged. The contrast with a truly absent file is asserted here in
+    the same test so the two cannot drift.
+    """
+    from no_human.testing.repro_gate import manifest_problem, persist_manifest
+
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_text("null")
+    problem = manifest_problem(tmp_path)
+    assert problem is not None, "a present `null` manifest must be named"
+    assert "top level is NoneType" in problem, problem
+    assert "no " + MANIFEST not in problem, problem
+    assert read_manifest(tmp_path) == []
+    assert persist_manifest(tmp_path, "task-x", home=tmp_path / "home") is False
+
+    absent = tmp_path / "elsewhere"
+    absent.mkdir()
+    assert manifest_problem(absent) is None, "an absent file is still the honest waive"
+
+
+def test_object_entries_with_id_are_read_as_node_ids(repo):
+    """AC1: task ad32398b's real shape — dicts under the correct "tests" key,
+    each carrying an "id" and a "why". Before the fix this mangled into a repr
+    that `_test_files` split into a fake path, and the gate failed the real
+    bugfix claiming a deleted test. After the fix it must pass exactly like
+    the plain string-list manifest does."""
+    (repo / MANIFEST).write_text(json.dumps({
+        "tests": [{"id": "test_repro.py::test_add_fixed",
+                   "why": "proves add() no longer subtracts"}],
+    }))
+    r = run_repro_gate(repo, "HEAD")
+    assert r.verdict == "pass", r.reasons
+    assert not any("missing from the attempt tree" in reason for reason in r.reasons)
+    assert r.tests == ["test_repro.py::test_add_fixed"]
+
+
+def test_read_manifest_extracts_id_from_object_entries(tmp_path):
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_text(json.dumps({
+        "tests": [{"id": "tests/t.py::t", "why": "because"}],
+    }))
+    assert read_manifest(tmp_path) == ["tests/t.py::t"]
+
+
+@pytest.mark.parametrize("entry", [
+    "tests/t.py::t",
+    {"id": "tests/t.py::t"},
+    {"id": "tests/t.py::t", "why": "x"},
+    {"test": "tests/t.py::t"},   # no "id" key
+    {"id": 5},                   # "id" not a string
+    7,
+    None,
+    ["tests/t.py::t"],           # nested list
+    True,
+])
+def test_every_entry_shape_yields_a_real_path_or_a_named_refusal(tmp_path, entry):
+    """AC2: no entry shape may be coerced with `str()` into a path that never
+    appeared in the manifest. Either the entry yields a real id straight out
+    of the input, or the whole manifest is refused by a message naming the
+    offending shape (never silently mangled into a bogus "missing" path —
+    this is the exact assertion that fails on `{'id': 'tests/...` today)."""
+    from no_human.testing.repro_gate import manifest_problem, SCHEMA_HINT
+    (tmp_path / ".no_human").mkdir()
+    raw = json.dumps({"tests": [entry]})
+    (tmp_path / MANIFEST).write_text(raw)
+    tests = read_manifest(tmp_path)
+    problem = manifest_problem(tmp_path)
+    for test_id in tests:
+        assert test_id in raw, (test_id, raw)
+    for f in repro_gate._test_files(tests):
+        assert f in raw, (f, raw)
+    if tests == []:
+        assert problem, "an unusable manifest must be named, not silently empty"
+        assert SCHEMA_HINT in problem
+    else:
+        assert problem is None
+
+
+def test_mixed_string_and_object_entries_are_refused_by_name(tmp_path):
+    """A single manifest must not mix the two entry forms —
+    refuse it by name (which forms, at which indices) rather than silently
+    accepting one and dropping/mangling the other."""
+    from no_human.testing.repro_gate import manifest_problem
+    (tmp_path / ".no_human").mkdir()
+    (tmp_path / MANIFEST).write_text(json.dumps({
+        "tests": ["a.py::t", {"id": "b.py::t"}],
+    }))
+    assert read_manifest(tmp_path) == []
+    problem = manifest_problem(tmp_path)
+    assert problem and "string" in problem and "object" in problem
