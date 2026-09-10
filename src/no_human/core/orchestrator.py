@@ -43,7 +43,7 @@ from ..agent.claude_backend import (
     ClaudeBackend,
     dewrap as _dewrap,
 )
-from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned
+from ..agent.scope_guard import SCRATCH_DIR, is_agent_owned, is_outside_repo
 from ..agent.supervisor import SEND_BACK_UNREADABLE, SupervisorHook
 from ..agent.verification_receipts import KINDS
 from ..blockers import (
@@ -504,18 +504,38 @@ def _summarize_tool_sig(tool: str, inp: dict) -> str:
 
 
 #: Common test-runner invocations, matched against a Bash tool call's raw
-#: command by `ConvergenceTracker` (P2). This is the closest cheap proxy the
-#: live event stream has for "a test result appeared": `tool_result` events
-#: never carry output text (`claude_backend._exit_status`'s docstring — only
-#: size, and an exit code on failure, by design), so whether the run PASSED
-#: cannot be read from the stream at all. Running one of these commands is
-#: itself evidence the attempt is verifying, not just looking around; it is
-#: not narrowed to project-specific commands because the convergence signal
-#: only needs "some test framework ran", not which one.
+#: command. ONE shared predicate feeds BOTH `ConvergenceTracker.mark_progress`
+#: (P2) and `StuckDetector`'s progress-gated hard edit-loop tier
+#: (`StuckDetector.note_test_run`, via `_note_test_activity` below) — this
+#: used to be two regexes (a stricter one here, a separate broader
+#: `_HARNESS_RUN_RE` feeding only the edit tier); that split let a coder
+#: whose runner is a harness script read as making no progress to whichever
+#: guard still used the narrower set, so it was collapsed into this one.
+#: This is the closest cheap proxy the live event stream has for "a test
+#: result appeared": `tool_result` events never carry output text
+#: (`claude_backend._exit_status`'s docstring — only size, and an exit code
+#: on failure, by design), so whether the run PASSED cannot be read from the
+#: stream at all. Running one of these commands is itself evidence the
+#: attempt is verifying, not just looking around.
+#:
+#: `node <script>` (task 0ab78498 attempt 1/2: `node /tmp/dcrace/harness.mjs`;
+#: f6e626fd attempt 1: `node web/e2e/dead-click-race.mjs`) is a POSITIONAL
+#: file argument only — `node\s+(?!-)\S+` requires the token right after
+#: `node` to not start with `-`, so `node -e '...'`, `node --require x` and
+#: `node --inspect` (utility/flag invocations, not a test/harness run) do
+#: NOT match; `node --test` still matches via its own alternative.
+#: `npm run <script>` counts ONLY for the test-adjacent script names
+#: `test`/`check`/`verify`/`spec` — `npm run build`, `npm run lint`,
+#: `npm run deploy` and any other script name are deliberately excluded as
+#: non-test executables (this subsumes the old bare `npm\s+(run\s+)?test`;
+#: `npm test` without `run` still matches via its own alternative).
+#: `npx playwright` is the third harness shape the incidents above used.
+#: Not narrowed to project-specific commands otherwise because the
+#: convergence signal only needs "some test framework ran", not which one.
 _TEST_RUNNER_RE = re.compile(
-    r"\b(pytest|py\.test|unittest|npm\s+(run\s+)?test|yarn\s+test|"
-    r"pnpm\s+test|node\s+--test|go\s+test|cargo\s+test|mvn\s+test|"
-    r"gradle\s+test|rspec|jest|vitest)\b"
+    r"\b(pytest|py\.test|unittest|npm\s+test|npm\s+run\s+(test|check|verify|spec)|"
+    r"yarn\s+test|pnpm\s+test|node\s+--test|node\s+(?!-)\S+|npx\s+playwright|"
+    r"go\s+test|cargo\s+test|mvn\s+test|gradle\s+test|rspec|jest|vitest)\b"
 )
 
 #: Leading tokens that make a shell segment a read-only SEARCH/INSPECTION,
@@ -566,6 +586,35 @@ def _looks_like_test_run(command: str) -> bool:
         if _TEST_RUNNER_RE.search(segment):
             return True
     return False
+
+
+def _test_run_summary(meta: dict | None) -> str:
+    """A human-readable, comparable outcome for one test-runner invocation.
+
+    Rendered from `tool_result` meta ALONE — the SDK never delivers output
+    text on the wire (`claude_backend._exit_status`'s docstring, by design,
+    so a printed credential is never captured): `exit_code` when a FAILED
+    result states one, else ``ok``/``failed`` from `is_error`, plus
+    `result_chars`. Two test-runner calls with the SAME outcome produce a
+    byte-identical string here; `StuckDetector.record_test_outcome` compares
+    consecutive strings (via `bounds._status_only`, which strips the chars
+    tail) to decide whether an edit-loop is real progress or the SAME
+    failure repeated (task f6e626fd).
+
+    Tolerates a missing/garbage `meta` so a degenerate `tool_result` still
+    yields a STABLE string rather than raising: `meta=None` reads as `{}`,
+    a missing `result_chars` reads as `0`, and a non-int `exit_code` is
+    still rendered via the same f-string (str()'d) rather than crashing.
+    Undercounts the same way `ConvergenceTracker`'s docstring already
+    documents for this seam: an outcome that changes WITHOUT changing its
+    length or its error/success status reads as unchanged.
+    """
+    meta = meta or {}
+    is_error = bool(meta.get("is_error", False))
+    exit_code = meta.get("exit_code")
+    status = (f"exit {exit_code}" if exit_code is not None
+              else ("failed" if is_error else "ok"))
+    return f"{status}, {meta.get('result_chars', 0)} chars"
 
 
 # How often the watcher re-reads `tasks.cancel_requested` while a task runs.
@@ -2431,6 +2480,52 @@ class Orchestrator:
             return scoped[1]
         return None
 
+    def _note_test_activity(self, event: AgentEvent) -> None:
+        """Feed a recognized test-runner `tool_use`/`tool_result` pair to
+        BOTH convergence signals this seam has: `ConvergenceTracker.mark_progress`
+        (P2 — "the command ran") and `StuckDetector`'s progress-gated hard
+        edit-loop tier (task f6e626fd — "the command's outcome CHANGED"; see
+        `StuckDetector.record_edit`/`record_test_outcome`). Guarded with
+        `getattr`/`_active_convergence()` so a bare `Orchestrator.__new__`
+        test fixture (no `_stuck`/`_convergence` set) stays safe.
+
+        A SINGLE predicate, `_looks_like_test_run` (backed by the shared
+        `_TEST_RUNNER_RE`), gates both signals — there is no separate,
+        wider "harness" predicate for `StuckDetector` alone. That two-tier
+        split existed for one round and was collapsed here: it let a coder
+        whose test runner is a harness script (`node <script>.mjs`, no
+        `--test` flag) register as making no progress to whichever guard
+        still used the narrower set. Task 0ab78498 attempt 2 measured the
+        cost of leaving the CONVERGENCE side narrow — 96 recorded Bash
+        calls, 7 of them genuine `node /tmp/dcrace/harness.mjs` runs (the
+        other 7 commands that merely mention `harness.mjs` are read-only
+        `grep`/`wc` inspections of the script, not executions of it — this
+        comment used to say "14", conflating the two; re-running the
+        current `_looks_like_test_run` against the recorded stream gives 7),
+        22 Reads, 7 Edits, killed by `ConvergenceTracker` at "no file edit or
+        test run in 40 turns" (recorded `failure_reason`: "non-converging-
+        abort: no file edit or test run in 40 turns (turn 122, threshold
+        80, window 40)") because the then-current `_TEST_RUNNER_RE` matched
+        `node --test`/`npm run test` but not a bare `node <script>`. Widening
+        the shared predicate makes `ConvergenceTracker` slightly easier to
+        keep alive on that shape — the intended correction, not an
+        oversight (see its docstring).
+        """
+        detector = getattr(self, "_stuck", None)
+        if event.kind == "tool_use" and event.tool_name in ("Bash", "Terminal"):
+            command = (event.tool_input or {}).get("command") or (
+                event.tool_input or {}).get("cmd") or ""
+            if _looks_like_test_run(command):
+                conv = self._active_convergence()
+                if conv is not None:
+                    conv.mark_progress()
+                if detector is not None:
+                    detector.note_test_run(event.meta.get("tool_use_id"))
+        elif event.kind == "tool_result" and detector is not None:
+            detector.record_test_outcome(
+                event.meta.get("tool_use_id"), _test_run_summary(event.meta)
+            )
+
     def _agent_sink(self, event: AgentEvent, *, role: str = CODER_ROLE) -> None:
         self._sink(
             {
@@ -2616,6 +2711,11 @@ class Orchestrator:
             # so edits there are neither committable nor a doom signal. Counting
             # them killed task 61406d02: the coder drafted in `.no_human/`, the
             # scope guard told it to revert, and the rewrite tripped the edit-loop.
+            # Paths outside the repo root entirely are the same class for the
+            # same reason: nothing written there can ever reach a commit either.
+            # Task 0ab78498 attempt 1 was hard-aborted on 15 edits of
+            # `/tmp/dcrace/harness.mjs`, a harness script the coder wrote next
+            # to the repo, not in it.
             #
             # The repo root is REQUIRED here: a concurrency worktree lives at
             # `~/.no_human/worktrees/<task_id>`, so every source file inside it has
@@ -2624,7 +2724,7 @@ class Orchestrator:
             # silently switch off.
             repo_root = getattr(self, "_active_repo_root", "")
             if path:
-                if not is_agent_owned(path, repo_root):
+                if not (is_agent_owned(path, repo_root) or is_outside_repo(path, repo_root)):
                     if not hasattr(self, "_agent_edited_files"):
                         self._agent_edited_files: set[str] = set()
                     self._agent_edited_files.add(str(path))
@@ -2641,10 +2741,13 @@ class Orchestrator:
                             "consider a different approach",
                         )
                 else:
-                    # P2 (review fix): a write into the agent's OWN sanctioned
-                    # scratch dir (`.no_human/` &c.) is still real CONVERGENCE
-                    # progress — report-kind tasks (investigation/design_doc)
-                    # draft their deliverable there before a final commit, and
+                    # P2 (review fix): a write the edit tier does not count
+                    # is still real CONVERGENCE progress. That is now two
+                    # kinds — the agent's OWN sanctioned scratch dir
+                    # (`.no_human/` &c.), and, since this change, ANY path
+                    # outside the repo root. Report-kind tasks
+                    # (investigation/design_doc) draft their deliverable in
+                    # the former before a final commit, and
                     # the corpus that motivated this fix showed exactly that
                     # shape: no committable edit until the very end, but real,
                     # periodic scratch writes throughout. It must NOT feed
@@ -2654,16 +2757,10 @@ class Orchestrator:
                     conv = self._active_convergence()
                     if conv is not None:
                         conv.mark_progress()
-        # P2: a test-runner invocation is the other convergence signal — see
-        # `ConvergenceTracker`'s docstring for why "the command ran" is the
-        # honest proxy available here, not "a new result appeared".
-        if event.kind == "tool_use" and event.tool_name in ("Bash", "Terminal"):
-            command = (event.tool_input or {}).get("command") or (
-                event.tool_input or {}).get("cmd") or ""
-            if _looks_like_test_run(command):
-                conv = self._active_convergence()
-                if conv is not None:
-                    conv.mark_progress()
+        # P2 + R2.3 Layer 1: a recognized test-runner invocation/outcome is fed
+        # to both the convergence tracker and the hard edit tier's progress
+        # gate — see `_note_test_activity`.
+        self._note_test_activity(event)
         # Hard tier (ARCH_REVIEW B2 #1): checked AFTER both record paths so an
         # edit-tool event counts toward both detectors before the verdict.
         # Advisory fires above are telemetry; this one has teeth — the raise

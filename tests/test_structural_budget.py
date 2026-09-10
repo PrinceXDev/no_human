@@ -1131,7 +1131,45 @@ FROZEN_FILE_LINES = {
     # tamper-fire row, which carries no id list and must not be stamped
     # classified. The comment now says that. Measured on this tree by the
     # scanner's own metric.
-    "core/orchestrator.py": 23731,
+    # 23730 -> 23818 (+88) 2026-09-09: edit-loop/convergence progress fix —
+    # `_TEST_RUNNER_RE` widened in place (no separate `_HARNESS_RUN_RE`) to
+    # recognize a bare `node <script>` positional harness run, test-adjacent
+    # `npm run (test|check|verify|spec)`, and `npx playwright`, feeding BOTH
+    # `ConvergenceTracker.mark_progress` and `StuckDetector.note_test_run`
+    # through the one shared `_looks_like_test_run` predicate; `_agent_sink`'s
+    # inline Bash/tool_result handling was replaced with a single call to
+    # `_note_test_activity`, which now does that dual dispatch itself; and the
+    # Write/Edit/MultiEdit/NotebookEdit branch gates `_agent_edited_files`/
+    # `record_edit` on `is_agent_owned(...) or is_outside_repo(...)`, so an
+    # edit to a path outside the repo root (task 0ab78498 attempt 1) is
+    # counted as convergence progress but not as a committable, loop-able
+    # edit. Measured on this tree by the scanner's own metric.
+    # 23818 -> 23820 (+2): `_note_test_activity`'s docstring cited an
+    # unverified "154 Bash calls, 29 Reads, 15 Edits" for task 0ab78498
+    # attempt 2; a direct query against the recorded `task_events` for that
+    # attempt's window found 96 Bash calls (14 of them repeated
+    # `node /tmp/dcrace/harness.mjs`), 22 Reads, 7 Edits instead, so the
+    # comment now cites those measured counts and the recorded
+    # `failure_reason` verbatim. Measured on this tree by the scanner's own
+    # metric.
+    # 23820 -> 23824 (+4): that "14... repeated `node /tmp/dcrace/harness.mjs`
+    # runs" count was itself wrong — it counted every recorded Bash call that
+    # merely mentions `harness.mjs` (including read-only `grep`/`wc`
+    # inspections of the script), not calls that actually execute it.
+    # Re-running the current `_looks_like_test_run` against the recorded
+    # attempt-2 stream matches exactly 7 commands, all genuine
+    # `node /tmp/dcrace/harness.mjs` executions; the other 7 "harness.mjs"
+    # mentions are grep/wc reads that `_looks_like_test_run` correctly does
+    # not match. The docstring now cites 7 and explains the discrepancy.
+    # Measured on this tree by the scanner's own metric.
+    # 23824 -> 23828 (+4) (landing merge and hand-finish): this branch and
+    # trunk's own 4a23ed43 follow-up both edited `core/orchestrator.py`, so
+    # the squash carries both and the merged total is neither side's frozen
+    # number; the remainder is the hand-finish, which rewrote the
+    # `_agent_sink` else-branch comment after that branch widened it to
+    # carry every out-of-repo path. Measured on the MERGED tree by the
+    # scanner's own metric.
+    "core/orchestrator.py": 23828,
     # +163: Codex account section in the Settings Account tab —
     # _codex_status_payload + endpoints (app.py) and the I4 AI-history repo
     # scoping filter in _gather_history.

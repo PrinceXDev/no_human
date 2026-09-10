@@ -204,6 +204,201 @@ def test_hard_stuck_edit_loop_at_abort_threshold():
     assert "edit-loop" in d.hard_stuck_reason
 
 
+def test_hard_edit_count_resets_after_a_changed_test_outcome():
+    """task f6e626fd: an edit followed by a test run whose outcome STATUS
+    changed is progress — the hard-tier per-file count resets to 1, so the
+    loop never crosses `edit_abort` no matter how many (edit, test) rounds
+    it takes, as long as each test run's exit-status differs from the last.
+
+    Send-back review round 2 (MAJOR-2/property 5): the two outcomes here
+    deliberately have the SAME `result_chars`-free status shape between
+    each other (alternating `exit 1` / `ok`) but a DIFFERENT status — output
+    size alone is not exercised here at all, because size alone must never
+    be what "progress" means (see `test_byte_size_alone_is_not_progress`
+    for the negative case)."""
+    d = StuckDetector()
+    for i in range(20):
+        d.record_edit("/a.py")
+        d.note_test_run(f"call-{i}")
+        status = "exit 1" if i % 2 == 0 else "ok"
+        assert d.record_test_outcome(f"call-{i}", f"{status}, {i} chars") is True
+        assert d.hard_stuck_reason is None
+
+
+def test_byte_size_alone_is_not_progress():
+    """Send-back review round 2 (MAJOR-2/property 5): two test-runner calls
+    with the SAME exit status but a DIFFERENT `result_chars` are NOT
+    progress — output size drifts on almost every real run (timestamps,
+    log noise) with no change in outcome, so it cannot be what "progress"
+    means. The hard tier must still fire at `edit_abort` when every
+    (edit, test) round only ever changes the byte count."""
+    d = StuckDetector()
+    # +1: the very first test outcome is always "new" (nothing recorded yet)
+    # and consumes one progress-reset, so it takes one extra round for the
+    # per-file count to climb back up to `edit_abort` under pure byte noise.
+    for i in range(d.edit_abort + 1):
+        d.record_edit("/a.py")
+        d.note_test_run(f"call-{i}")
+        changed = d.record_test_outcome(f"call-{i}", f"exit 1, {100 + i} chars")
+        assert changed is (i == 0)  # only the very first observation is "new"
+    assert d.hard_stuck_reason is not None
+    assert "edit-loop" in d.hard_stuck_reason
+
+
+def test_identical_test_outcome_is_not_progress():
+    """The counterpart: a test run whose outcome is byte-identical to the
+    previous one is NOT progress — the hard tier still fires at
+    `edit_abort`, and the reason text carries the last two summaries."""
+    d = StuckDetector()
+    d.record_edit("/a.py")
+    d.note_test_run("call-0")
+    assert d.record_test_outcome("call-0", "exit 1, 40 chars") is True  # first ever
+    d.record_edit("/a.py")  # progress consumed here -> hard count resets to 1
+    d.note_test_run("call-1")
+    assert d.record_test_outcome("call-1", "exit 1, 40 chars") is False  # identical
+    for _ in range(d.edit_abort - 2):
+        d.record_edit("/a.py")
+    assert d.hard_stuck_reason is None
+    d.record_edit("/a.py")
+    assert d.hard_stuck_reason is not None
+    assert "edit-loop" in d.hard_stuck_reason
+    assert "no observed progress" in d.hard_stuck_reason
+    assert "exit 1, 40 chars" in d.hard_stuck_reason
+
+
+def test_editing_a_different_file_in_between_is_not_progress():
+    """Send-back review round 2 (MAJOR-1/property 3): editing a DIFFERENT
+    file in between no longer resets a file's hard count on its own — an
+    agent bouncing between two files with no observed outcome change is
+    still a loop. (Previously this reset let exactly that escape both the
+    hard tier and ping-pong; task a50b8b6c/3adc13f5 in the recorded corpus
+    was saved from a real abort by nothing else.)"""
+    d = StuckDetector()
+    for _ in range(d.edit_abort - 1):
+        d.record_edit("/a.py")
+    assert d.hard_stuck_reason is None
+    d.record_edit("/b.py")  # a different file in between — NOT progress for /a.py
+    assert d.hard_stuck_reason is None  # /a.py is at edit_abort - 1, /b.py at 1
+    d.record_edit("/a.py")
+    assert d.hard_stuck_reason is not None
+    assert "/a.py" in d.hard_stuck_reason
+
+
+def test_ab_cross_file_loop_with_no_progress_signal_still_aborts():
+    """Property 3's explicit driven test: an agent alternating between two
+    files, with NO test-runner activity at all (so no progress signal ever
+    fires), must still hard-abort — each file's own per-file count climbs
+    independently and unconditionally now that cross-file editing is not
+    treated as progress."""
+    d = StuckDetector()
+    aborted_at = None
+    for i in range(40):
+        d.record_edit("/a.py" if i % 2 == 0 else "/b.py")
+        if d.hard_stuck_reason is not None:
+            aborted_at = i
+            break
+    assert aborted_at is not None
+    assert "edit-loop" in d.hard_stuck_reason
+    assert "/a.py" in d.hard_stuck_reason  # /a.py lands on the even indices, hits first
+
+
+def test_absolute_edit_ceiling_fires_even_under_sustained_progress():
+    """Property 2: an ABSOLUTE per-file ceiling that no progress signal can
+    lift. A file whose test outcome genuinely flips (real status
+    transitions, not byte-size noise) every single round resets the
+    progress-gated `edit_abort` tier every time — by design, since each
+    round IS observed progress — but the raw, never-reset `_edit_counts`
+    this class already keeps for the advisory tier keeps climbing, and
+    `edit_ceiling` reads it unconditionally. (A corpus replay of recorded
+    attempts 77f12aab/86f70e12, task c19a376c, against this fixed detector
+    found the OPPOSITE of a ceiling-fire: both stop aborting altogether —
+    the progress-gated tier tops out at 3-6 and the raw count at 14-15,
+    never reaching `edit_ceiling`=30 — a genuine-convergence case, not this
+    one. This test's ceiling scenario is exercised directly, synthetically,
+    below.)"""
+    d = StuckDetector()
+    aborted_at = None
+    for i in range(60):
+        d.record_edit("/flaky.py")
+        d.note_test_run(f"c{i}")
+        d.record_test_outcome(f"c{i}", "ok, 1 chars" if i % 2 == 0 else "failed, 1 chars")
+        if d.hard_stuck_reason is not None:
+            aborted_at = i
+            break
+    assert aborted_at is not None
+    assert "absolute per-file ceiling" in d.hard_stuck_reason
+    assert d._edit_counts["/flaky.py"] == d.edit_ceiling
+    # The progress-gated tier never once crossed edit_abort — confirms the
+    # ceiling, not the ordinary hard tier, is what fired.
+    assert d._hard_edit_counts["/flaky.py"] < d.edit_abort
+
+
+def test_unjoinable_test_result_is_not_progress():
+    """A `tool_result` whose id was never registered by `note_test_run` (an
+    unpaired backend, or one with no test-runner recognized) must not count
+    as progress — preserves the pre-existing fallback behaviour."""
+    d = StuckDetector()
+    assert d.record_test_outcome("never-registered", "exit 1, 40 chars") is False
+    for _ in range(d.edit_abort - 1):
+        d.record_edit("/a.py")
+    assert d.hard_stuck_reason is None
+    d.record_edit("/a.py")
+    assert d.hard_stuck_reason is not None
+
+
+def test_a_run_with_no_test_activity_at_all_still_aborts():
+    """AC4: a sequence with no test run at all (never calls `note_test_run`/
+    `record_test_outcome`) must still hard-abort at `edit_abort` — the
+    progress gate only ever LIFTS the count on an observed outcome change, it
+    never blocks the tier from firing when there is no test activity to
+    observe."""
+    d = StuckDetector()
+    for _ in range(d.edit_abort - 1):
+        d.record_edit("/a.py")
+    assert d.hard_stuck_reason is None
+    d.record_edit("/a.py")
+    assert d.hard_stuck_reason is not None
+    assert "edit-loop" in d.hard_stuck_reason
+
+
+def test_an_empty_or_unparsable_test_result_is_not_progress():
+    """AC4: an empty (`""`) or degenerate (missing `result_chars`, unparsable
+    `exit_code`) test outcome still yields a STABLE summary string via
+    `_test_run_summary`/`record_test_outcome` — repeating the SAME degenerate
+    summary is therefore not progress, and the hard tier still fires at
+    `edit_abort`."""
+    d = StuckDetector()
+    # `record_edit` consumes the progress flag set by the PREVIOUS call's
+    # `record_test_outcome`, so with the two interleaved one edit-call behind
+    # (round 0's "changed" reset lands on round 1's edit, not round 0's), one
+    # extra round beyond `edit_abort` is needed to actually reach the ceiling.
+    for i in range(d.edit_abort + 1):
+        d.record_edit("/a.py")
+        d.note_test_run(f"call-{i}")
+        changed = d.record_test_outcome(f"call-{i}", "")
+        assert changed is (i == 0)  # only the very first observation is "new"
+    assert d.hard_stuck_reason is not None
+    assert "edit-loop" in d.hard_stuck_reason
+
+
+def test_advisory_edit_tier_still_reports_the_raw_count():
+    """The advisory tier (`stuck_reason`, raw `_edit_counts`) must be totally
+    unaffected by progress: it still fires purely on the raw per-file count,
+    even while the hard tier keeps resetting on progress."""
+    d = StuckDetector(edit_threshold=3)
+    d.record_edit("/a.py")
+    d.note_test_run("c0")
+    d.record_test_outcome("c0", "exit 1, 1 chars")
+    d.record_edit("/a.py")
+    d.note_test_run("c1")
+    d.record_test_outcome("c1", "exit 1, 2 chars")  # same status - not progress, but
+    assert d.hard_stuck_reason is None  # far under edit_abort=15 either way
+    assert d.record_edit("/a.py") is True  # advisory: raw count hit threshold=3
+    assert d._edit_counts["/a.py"] == 3
+    assert d.stuck_reason is not None
+    assert "edit-loop" in d.stuck_reason
+
+
 def test_hard_stuck_sustained_ping_pong():
     d = StuckDetector()
     for _ in range(5):  # 10 alternating calls — advisory, not abort
@@ -580,3 +775,36 @@ def test_convergence_from_config_bad_types_fall_back_to_defaults():
     })
     assert c.min_turns == 80
     assert c.window == 40
+
+
+def test_only_the_last_two_test_outcomes_are_kept():
+    """The stuck reason quotes the recent test outcomes, and the acceptance
+    criterion says the last TWO. Nothing pinned that bound: widening the
+    retained window left all 163 tests in this file and its three siblings
+    green, so a later edit could quietly
+    grow an unbounded string into an event row — the class of defect that
+    produced the unbounded `test_results` row fixed in 4a23ed43.
+
+    Asserted through the public `last_test_summaries` accessor, which is
+    otherwise the only reader outside the class and had no consumer at all.
+    """
+    d = StuckDetector()
+    for i in range(5):
+        # An outcome is only recorded against a run this detector saw start —
+        # `record_test_outcome` drops an id `note_test_run` never registered.
+        d.note_test_run(f"call-{i}")
+        d.record_test_outcome(f"call-{i}", f"exit {i}, 10 chars")
+
+    kept = d.last_test_summaries
+    assert kept == ["exit 3, 10 chars", "exit 4, 10 chars"], kept
+    assert len(kept) == 2, kept
+
+    # The reason text a stuck abort emits carries those same two, in order,
+    # and nothing older — so the bound is what keeps that row bounded.
+    for _ in range(StuckDetector().edit_abort + 1):
+        d.record_edit("/repo/a.py")
+    reason = d.hard_stuck_reason
+    assert reason is not None, "the edit ceiling must have fired by now"
+    assert "last test outcomes" in reason, reason
+    assert "exit 4" in reason and "exit 3" in reason, reason
+    assert "exit 2" not in reason, reason
