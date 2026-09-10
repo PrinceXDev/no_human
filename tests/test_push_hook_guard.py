@@ -3,7 +3,8 @@
 `agent/guard.py` matches strings on the command line the agent PROPOSED. That
 cannot resolve shell expansion, so `git push origin $(echo main)` carried no
 token reading as `main` and was allowed straight through to a real push. The
-coder runs with `permission_mode="bypassPermissions"`, so on the Bash path that
+coder runs with `permission_mode="bypassPermissions"` by default — and Bash is
+pre-approved under the alternative `acceptEdits` mode — so on the Bash path that
 matcher was the only gate — `GitRepo.push`'s `ProtectedBranch` check is never
 reached by an agent shelling out to `git`.
 

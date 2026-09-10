@@ -1504,21 +1504,33 @@ def test_the_open_pr_push_detector_reads_calls_not_names(body, expected):
 
 
 def test_the_unbounded_egress_channel_is_named(security_doc):
-    """The coder session has Bash and no tool allowlist. Say it, don't imply it.
+    """The coder session has Bash. Say it, don't imply it.
 
-    Mandatory hit: the default really is `bypassPermissions` and there really is
-    no `allowed_tools`/`disallowed_tools` restriction. If someone ADDS a
-    restriction, this fails — correctly, because the doc would then be
-    overstating the risk and needs rewriting in the other direction.
+    What §7 rests on is narrower than "nothing is ever restricted", because
+    that was never true: the SDK folds `skills` into the same `--allowedTools`
+    argument, so a skill-enabled run has carried an allowlist all along. The
+    PROPERTY the doc depends on is that Bash is available in every mode this
+    product ships — pinning the ABSENCE of a string is what goes stale, and
+    this repository has been bitten by that shape before.
+
+    A DENYLIST is still absent, and is asserted separately below. The
+    assertion this replaced covered it only by accident: `"allowed_tools"` is
+    a substring of `"disallowed_tools"`, so one test happened to guard both.
     """
     backend = CLAUDE_BACKEND.read_text(encoding="utf-8")
     assert 'permission_mode: str = "bypassPermissions"' in backend, (
         "claude_backend no longer defaults to bypassPermissions — the egress "
         "doc's central caveat may now be wrong; re-read it"
     )
-    assert "allowed_tools" not in backend, (
-        "claude_backend now restricts tools — docs/security.md says the coder "
-        "session is unrestricted, and that is no longer true"
+    from no_human.agent.claude_backend import PRE_APPROVED_TOOLS
+    assert "Bash" in PRE_APPROVED_TOOLS, (
+        "the non-default permission mode no longer pre-approves Bash — "
+        "docs/security.md §7 describes an unbounded Bash channel that may no "
+        "longer exist; re-read it"
+    )
+    assert "disallowed_tools" not in backend, (
+        "claude_backend now DENIES tools — docs/security.md §7 says the coder "
+        "session carries no tool denylist, and that is no longer true"
     )
 
     body = security_doc.split("## 7.", 1)[1]
@@ -1980,9 +1992,11 @@ def _token_line_in_symbol(source_text: str, symbol: str, token: str) -> int | No
 CITATION_TABLE = (
     # docs/security.md
     ("security.md", "guard.py:WRITE_TOOLS", "guard.py", 'WRITE_TOOLS = {"Write"'),
-    ("security.md", "agent/claude_backend.py:ClaudeBackend.__init__:520",
+    ("security.md", "agent/claude_backend.py:ClaudeBackend.__init__:540",
      "agent/claude_backend.py", 'permission_mode: str = "bypassPermissions"'),
-    ("security.md", ":ClaudeBackend.__init__:545", "agent/claude_backend.py",
+    ("security.md", "agent/claude_backend.py:PRE_APPROVED_TOOLS",
+     "agent/claude_backend.py", 'PRE_APPROVED_TOOLS = ("Bash",)'),
+    ("security.md", ":ClaudeBackend.__init__:565", "agent/claude_backend.py",
      "PreToolUse guard"),
     ("security.md", "vcs/pr_watcher.py:default_pr_state", "vcs/pr_watcher.py",
      '"gh", "pr", "view"'),
