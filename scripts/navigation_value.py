@@ -26,7 +26,10 @@ the product, so it runs against a database or a log written by any version):
     coder ``tool_use`` with its `tool_name`/`tool_input`, and every
     ``tool_result`` with `result_chars` and a `tool_use_id` join key. This is
     the authoritative population — it is no_human's coder, not a human's
-    session — and on a fresh checkout it is empty.
+    session — and on a fresh checkout it is empty. Its searches are Bash
+    commands, not `Grep` calls, and the command text is in `tool_input`
+    verbatim; reading only the `Grep` tool made this source's strongest class
+    structurally empty. See ``SHELL_TOOLS``.
   * ``--source transcripts`` — Claude Code's own session logs under
     ``~/.claude/projects/*/*.jsonl`` (and ``~/.claude-personal``). The same
     harness, one JSON object per line, carrying the same `tool_use` /
@@ -42,14 +45,17 @@ the product, so it runs against a database or a log written by any version):
 WHAT COUNTS AS NAVIGATION-ANSWERABLE, and why each class is reported on its
 own line rather than folded into one number:
 
-  ``symbol_lookup``   A read within ``--lookback`` tool calls of a Grep whose
-                      PATTERN reads as a symbol query rather than a text
+  ``symbol_lookup``   A read within ``--lookback`` tool calls of a SEARCH
+                      whose pattern reads as a symbol query rather than a text
                       search (an identifier, optionally behind a
                       `def`/`class`/`function`/`interface`/... keyword). This
                       is go-to-definition done by hand, and it is the
                       strongest class here because the substitute tool is
                       exact: the agent asked "where is S", by the only means
-                      it has.
+                      it has. "A search" means the `Grep` tool OR a
+                      grep/rg/ag/ack inside a shell command, and the second
+                      half of that is not an extra — it is the only channel
+                      no_human's coder actually uses. See ``SHELL_TOOLS``.
   ``whole_file``      A read with no `offset`/`limit` whose result exceeds
                       ``--large-read-chars``. The issue's own wording —
                       "exploration tokens target large-file reads". Weaker
@@ -101,10 +107,22 @@ symbol response would be nearly as large, there is nothing to win.
 THE VERDICT CHECKS ITSELF. Every decision is re-taken at half and double the
 large-read threshold, and when the answer changes the report says so. This is
 not hypothetical caution: on the transcript corpus the pre-registered 12,000
-chars gives HALT at 10.4% / 13.7% and 6,000 gives PROCEED at 19.1% / 24.3%.
-Pre-registering a threshold stops it being tuned to the answer; it does not
-make the answer a property of the data, and only the probe can tell the two
-apart.
+chars gives HALT at 11.2% / 14.6% and 6,000 gives PROCEED. Pre-registering a
+threshold stops it being tuned to the answer; it does not make the answer a
+property of the data, and only the probe can tell the two apart. Each probe
+also carries the number of reads that QUALIFIED at its threshold, because a
+probe that qualified almost nothing could not have disagreed and its agreement
+is not corroboration.
+
+THE SEARCH CENSUS GATES THE VERDICT. ``symbol_lookup`` reaching 0 has several
+causes that the class alone renders identically — no search calls in the
+source at all, searches this script could not extract a pattern from, patterns
+that were all text, or symbol searches that no read followed. A corpus with
+reads and NO searches is REFUSED rather than decided (`NoSearchChannel`),
+because it can clear every floor and render a confident negative resting
+entirely on the size heuristic. That is not hypothetical either: it is what
+this script did on the product's own telemetry until the shell channel was
+read.
 
 HONEST LIMITS, so nobody reads more out of the table than is in it:
 
@@ -114,6 +132,22 @@ HONEST LIMITS, so nobody reads more out of the table than is in it:
     symbol question the agent answered from memory with no Grep at all
     (under). Neither error's size is known, and no aggregate here should be
     read as "the agent wanted a symbol".
+  * A BARE ENGLISH WORD IS INDISTINGUISHABLE FROM A SYMBOL NAME, and this is
+    the largest known over-count in the class the verdict now leans on. Read
+    over 1,470 real patterns, `symbol_lookup` accepts `warning`, `snapshots`
+    and `node_modules` alongside `parse_config` and `_run_at_commit`, because
+    nothing in a pattern says whether the identifier-shaped thing being
+    searched for is a name in the code or a word in a string. No rule over the
+    pattern ALONE can separate them; separating them needs the search's hits,
+    which the product deliberately does not record (next bullet).
+  * THE SHELL PARSE IS BEST-EFFORT. The option tables in ``_VALUE_SHORTS`` and
+    ``_VALUE_LONGS`` are hand-written, so a flag whose value is read as a
+    pattern, or a pattern missed behind an unlisted flag, is possible. Both
+    only move ``symbol_lookup``, and a segment that could not be tokenized
+    cleanly contributes a SEARCH with no pattern rather than a guessed one —
+    which is why ``searches_with_pattern`` is reported separately from
+    ``searches``, as this script's own coverage rather than as a fact about
+    the agent.
   * ``symbol_lookup`` is ADJACENCY, not causation. Whether the read's path was
     actually among the Grep's hits cannot be checked on both sources: the
     product records a search result's SIZE and never its text (deliberately —
@@ -160,6 +194,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -191,6 +226,78 @@ TRANSCRIPT_ROOTS = (
 #: and counting it would let path globbing masquerade as go-to-definition.
 READ_TOOLS = frozenset({"Read", "View"})
 SYMBOL_QUERY_TOOLS = frozenset({"Grep", "Search"})
+
+#: Tools whose input is a SHELL COMMAND, which for no_human's coder is where
+#: every search actually happens.
+#:
+#: 🔴 THE SEARCH-TOOL SET ALONE MAKES `symbol_lookup` STRUCTURALLY EMPTY ON THE
+#: PRODUCT'S OWN TELEMETRY, and the first version of this script shipped that
+#: way. Measured on the fleet database, coder events only:
+#:
+#:     Bash 115,776 | Read 35,557 | Edit 18,425 | Write 3,010
+#:     Grep 0 | Glob 0 | Search 0
+#:     Bash calls containing grep/rg/ag/ack: 50,459
+#:
+#: The coder never emits `Grep`, so the strongest class could only ever be 0
+#: and the verdict fell back entirely to the size heuristic while still
+#: rendering as though it had two signals. That is not an accident of one
+#: install either — `core/prompt_blocks.py` INSTRUCTS the coder to "locate the
+#: relevant lines with `grep -n`" for a large file, so the shell is the
+#: sanctioned search channel and always was.
+SHELL_TOOLS = frozenset({"Bash", "Terminal", "Shell"})
+
+#: Search binaries recognised inside a shell command, matched on the basename
+#: so `/usr/bin/grep` counts. `git grep` is handled as a two-token special
+#: case. Scoped to the POSIX grep family because that is what the coder's own
+#: prompt tells it to use and what the 50,459 figure above measured;
+#: PowerShell's `Select-String` is deliberately NOT parsed — its parameter
+#: syntax needs a different tokenizer, and guessing at it would put made-up
+#: patterns into the class the verdict leans on hardest. A PowerShell-only
+#: corpus therefore reports zero searches and is REFUSED rather than decided.
+_SEARCH_BINARIES = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack", "ack-grep", "ugrep",
+})
+
+#: Splits a shell command on its control operators, so `cat x | grep foo` is
+#: judged on the segment that actually searches. Same expression, for the same
+#: reason, as `orchestrator._SHELL_SEGMENT_RE`.
+_SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[|;]")
+
+#: Wrappers that precede the real binary and carry no pattern of their own.
+_SHELL_WRAPPERS = frozenset({
+    "sudo", "command", "time", "env", "nice", "ionice", "xargs", "nohup",
+    "stdbuf", "builtin", "exec", "then", "do", "!",
+})
+
+#: Short options that consume the NEXT token (or the rest of their own bundle),
+#: per binary. `-r` is the reason this is per-binary rather than one set: in
+#: grep it means recursive and takes nothing, in ripgrep it is `--replace` and
+#: takes a value — one shared table would either eat `grep -r PATTERN`'s
+#: pattern or misread `rg -r NEW PATTERN`.
+_VALUE_SHORTS = {
+    "grep": frozenset("efmABCdD"),
+    "rg": frozenset("efgtTMABCmjr"),
+    "ag": frozenset("efmABCGp"),
+    "ack": frozenset("efmABC"),
+}
+
+#: Long options that consume the next token when not written with `=`.
+#: `--color`/`--colour` are deliberately ABSENT: their argument is optional and
+#: is almost always written `--color=auto`, so listing them would make
+#: `grep --color PATTERN` eat its own pattern — the more common shape of the
+#: two. The option tables are best-effort, and both ways of being wrong (a
+#: missed pattern, a flag's value read as one) only move `symbol_lookup`; the
+#: doc states that rather than implying the parse is exact.
+_VALUE_LONGS = frozenset({
+    "--regexp", "--file", "--max-count", "--after-context", "--before-context",
+    "--context", "--include", "--exclude", "--exclude-dir", "--exclude-from",
+    "--glob", "--iglob", "--type", "--type-not", "--type-add", "--replace",
+    "--max-columns", "--max-depth", "--max-filesize", "--threads",
+    "--binary-files", "--devices", "--directories", "--label", "--pre",
+})
+
+#: Long options that name a PATTERN rather than a file or a limit.
+_PATTERN_LONGS = frozenset({"--regexp"})
 
 #: Extensions a definition/references/hover call can actually answer for. A
 #: CLOSED allowlist, and the most consequential constant in this file: the
@@ -259,6 +366,21 @@ class EmptyInputSet(SystemExit):
         super().__init__(f"FAIL (empty input set): {message}")
 
 
+class NoSearchChannel(SystemExit):
+    """No search calls in the corpus, so `symbol_lookup` cannot exist.
+
+    The same refusal as `EmptyInputSet` and for the same reason, one signal
+    over: a corpus this instrument cannot see searches in can still produce
+    reads, clear both floors, and render a confident HALT resting entirely on
+    the size heuristic. That is what the first version of this script did on
+    the product's own telemetry. An absent channel is a gap in the instrument
+    or the source, never evidence about the agent, so it gets no verdict.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(f"FAIL (no search channel): {message}")
+
+
 # --------------------------------------------------------------------------- #
 # Is this Grep pattern a symbol query, or a text search?                      #
 # --------------------------------------------------------------------------- #
@@ -280,19 +402,16 @@ _DECL_PREFIX = re.compile(
 #: inflate the strongest class with the least evidence.
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}$")
 
-#: An argument list or an assignment tail is part of how a declaration is
-#: SPELLED, not part of the name: `foo(`, `foo\(self`, `foo =`, `foo: string`.
-_NAME_TAIL = re.compile(r"\\?[(=:]")
+#: An argument list is part of how a name is SPELLED wherever it appears, so
+#: `foo(` and `foo\(self` yield `foo` with or without a declaration keyword.
+_CALL_NAME_TAIL = re.compile(r"\\?[(]")
 
-#: Whitespace-separated tokens allowed once the declaration prefix is off.
-#: TWO, and this bound is what makes `_NAME_TAIL` safe. Splitting on `:` while
-#: any number of tokens was allowed kept only the text BEFORE the colon, so
-#: `TODO: fix the reviewer before the next release` normalised to `TODO` and
-#: was reported as a go-to-definition — a whole class of prose search
-#: misfiling itself into the strongest class. Two tokens is what an annotated
-#: declaration needs (`foo: string`) and one fewer than any prose that has
-#: reached this far.
-_MAX_NAME_TOKENS = 2
+#: `=` and `:` only end a name when a DECLARATION keyword introduced it
+#: (`const foo: string`, `let foo = 1`). Without one, `kind="tool_result"` and
+#: `risk:` are searches for a key or an attribute value, and keeping their
+#: left-hand side reported both as go-to-definition — measured as real false
+#: positives on 1,470 patterns.
+_DECL_NAME_TAIL = re.compile(r"\\?[(=:]")
 
 
 def is_symbol_query(pattern: str) -> bool:
@@ -305,26 +424,202 @@ def is_symbol_query(pattern: str) -> bool:
     questions asked awkwardly. Under-counting the strongest class biases the
     verdict toward HALT, which is the safe direction for a gate that authorises
     building infrastructure.
+
+    `_IDENTIFIER` IS ANCHORED, AND THAT IS THE WHOLE FILTER. What survives
+    normalisation must match `^[A-Za-z_][A-Za-z0-9_]{2,}$` end to end, so
+    whitespace, quotes, alternations and character classes are all rejected by
+    that one test rather than by separate guards. Two earlier versions carried
+    an explicit quote check and a token-count bound; once quotes stopped being
+    stripped and the `=`/`:` tail became declaration-gated, neither could
+    change an outcome, and an unreachable guard whose comment claims to
+    prevent a defect is worse than no guard — it tells the next reader the
+    wrong thing about what protects what. Both were removed and the cases they
+    named are pinned as behaviour in the test table instead.
+
+    TWO RULES CAME OUT OF READING WHAT THIS ACTUALLY ACCEPTED over 1,470 real
+    search patterns, and both were false positives in this very class:
+
+    * QUOTES ARE NOT STRIPPED. Stripping them off both ends turned the
+      fragment `"Test` (a token `_segment_argv`'s unbalanced-quote fallback
+      produced) into `Test`, and the deliberate `'"version"'` — a search for a
+      quoted JSON key — into `version`. A symbol's NAME never contains a
+      quote, so leaving them in place lets `_IDENTIFIER` reject both: a
+      pattern carrying a quote is either a fragment or a search for a string
+      literal, and it is text under either reading.
+    * THE `=`/`:` TAIL IS ONLY A DECLARATION'S TAIL. Cutting it
+      unconditionally kept the left-hand side of `kind="tool_result"` and
+      `risk:` and reported them as name lookups, when both search for a key or
+      an attribute VALUE that no definition call answers. It is cut only when
+      a declaration keyword was actually stripped, which is the case it was
+      written for (`const foo: string`). `foo(` needs no keyword and keeps its
+      own split, and prose keeps its spaces and so cannot match.
     """
     if not pattern or len(pattern) > 80:
-        # A long pattern is prose or a composed regex. The bound also keeps
-        # this cheap on a corpus carrying a pathological pattern.
+        # A long pattern is prose or a composed regex, and a long single token
+        # is not a name anyone typed. The bound also keeps this cheap on a
+        # corpus carrying a pathological pattern.
         return False
-    p = pattern.strip().strip("\"'")
     # `\s+`/`\s*` are how a symbol search spells the space in `def  foo`, and
     # `\b` is how it anchors one. Both are word-boundary noise, not structure.
+    p = pattern.strip()
     p = p.replace("\\s+", " ").replace("\\s*", " ").replace("\\b", "")
     p = p.strip().lstrip("^").rstrip("$").strip()
-    p = _DECL_PREFIX.sub("", p, count=1).strip()
-    if len(p.split()) > _MAX_NAME_TOKENS:
-        # Prose, or a signature this rule declines to parse (`public static
-        # void main` is four tokens and Java's return type is not a keyword
-        # `_DECL_PREFIX` can anchor on). Declining under-counts the strongest
-        # class, which biases the verdict toward HALT — the safe direction for
-        # a gate that authorises building infrastructure.
-        return False
-    p = _NAME_TAIL.split(p, maxsplit=1)[0].strip()
-    return bool(_IDENTIFIER.match(p))
+    stripped = _DECL_PREFIX.sub("", p, count=1).strip()
+    declared = stripped != p
+    tail = _DECL_NAME_TAIL if declared else _CALL_NAME_TAIL
+    return bool(_IDENTIFIER.match(tail.split(stripped, maxsplit=1)[0].strip()))
+
+
+# --------------------------------------------------------------------------- #
+# The coder's real search channel: a grep inside a shell command              #
+# --------------------------------------------------------------------------- #
+
+def _basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _segment_argv(segment: str) -> tuple[list[str], bool]:
+    """``(tokens, tokenized_cleanly)`` for one shell segment.
+
+    `shlex` is used so `grep -n "def parse_config" src/` yields the pattern as
+    ONE token rather than two. It raises on an unbalanced quote, which a real
+    command legitimately has (an embedded regex, a partial heredoc), and the
+    fallback is a plain split rather than dropping the segment — dropping it
+    would shrink the search census, and the census is what decides whether
+    this script may return a verdict at all.
+
+    But a fallback split's tokens are NOT a parse, and the second element of
+    the return is what says so. Splitting `grep -rn "def foo bar" .` on
+    whitespace makes the pattern operand `"def`, a fragment that is not the
+    thing searched for. Such a segment is reported as a SEARCH carrying NO
+    pattern, which is the honest reading and is already a column
+    (``searches_with_pattern``) — a fabricated pattern would land in the class
+    the verdict leans on hardest.
+    """
+    try:
+        return shlex.split(segment, posix=True), True
+    except ValueError:
+        return segment.split(), False
+
+
+def _pattern_from_argv(binary: str, argv: list[str]) -> str | None:
+    """The search PATTERN in one search invocation's arguments, or ``None``.
+
+    Explicit `-e`/`--regexp` wins over the positional operand, because when
+    both are present the operand is a PATH. `-f FILE` means the patterns live
+    in a file this script cannot see, so it yields ``None`` — an unextractable
+    pattern is reported as such and never guessed at.
+    """
+    value_shorts = _VALUE_SHORTS.get(binary, _VALUE_SHORTS["grep"])
+    explicit: list[str] = []
+    operand: str | None = None
+    from_file = False
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if token == "--":
+            # Everything after `--` is an operand: the first is the pattern.
+            if operand is None and index < len(argv):
+                operand = argv[index]
+            break
+        if token.startswith("--"):
+            name, sep, inline = token.partition("=")
+            if name in _PATTERN_LONGS:
+                if sep:
+                    explicit.append(inline)
+                elif index < len(argv):
+                    explicit.append(argv[index])
+                    index += 1
+            elif name in ("--file",):
+                from_file = True
+                if not sep and index < len(argv):
+                    index += 1
+            elif name in _VALUE_LONGS and not sep and index < len(argv):
+                index += 1
+            continue
+        if token.startswith("-") and len(token) > 1:
+            # A bundle of short options: `-rn`, `-A3`, `-rne PATTERN`. A letter
+            # that takes a value consumes the REST of the bundle when there is
+            # one, else the next token.
+            letters = token[1:]
+            for position, letter in enumerate(letters):
+                if letter not in value_shorts:
+                    continue
+                rest = letters[position + 1:]
+                if letter == "e":
+                    if rest:
+                        explicit.append(rest)
+                    elif index < len(argv):
+                        explicit.append(argv[index])
+                        index += 1
+                elif letter == "f":
+                    from_file = True
+                    if not rest and index < len(argv):
+                        index += 1
+                elif not rest and index < len(argv):
+                    index += 1
+                break
+            continue
+        if operand is None:
+            operand = token
+    if explicit:
+        return explicit[0]
+    if from_file:
+        # The pattern exists but not where this script can read it. Saying so
+        # keeps `searches` and `searches_with_pattern` honestly different.
+        return None
+    return operand
+
+
+def shell_search(command: str) -> tuple[bool, tuple[str, ...]]:
+    """``(is_a_search, patterns)`` for one shell command.
+
+    Per SEGMENT, so a search anywhere in a pipeline counts and a compound
+    command is not judged by its first word alone — the same decomposition
+    `orchestrator._looks_like_test_run` makes, and for the same measured
+    reason: a corpus replay found `rg pytest` misread as a test RUN when the
+    command was inspected whole.
+
+    The two halves of the return are deliberately independent. A recognised
+    search whose pattern cannot be extracted (`grep -f patterns.txt`) is still
+    a SEARCH, and collapsing the two would let a parser gap read as "this
+    corpus does not search" — the exact false negative that made the first
+    version of this script decide the phase on one signal.
+    """
+    if not command:
+        return False, ()
+    found = False
+    patterns: list[str] = []
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        argv, clean = _segment_argv(segment.strip())
+        cursor = 0
+        # Step past `FOO=bar` env assignments and wrappers to the real binary.
+        while cursor < len(argv) and (
+                _SHELL_WRAPPERS.__contains__(_basename(argv[cursor]))
+                or ("=" in argv[cursor] and not argv[cursor].startswith("-")
+                    and argv[cursor].split("=", 1)[0].isidentifier())):
+            cursor += 1
+        if cursor >= len(argv):
+            continue
+        binary = _basename(argv[cursor])
+        rest = argv[cursor + 1:]
+        if binary == "git":
+            if not rest or rest[0] != "grep":
+                continue
+            binary, rest = "grep", rest[1:]
+        elif binary not in _SEARCH_BINARIES:
+            continue
+        found = True
+        if not clean:
+            # A search, and one whose pattern this script will not invent.
+            continue
+        table = "rg" if binary in ("rg", "ripgrep") else (
+            binary if binary in _VALUE_SHORTS else "grep")
+        pattern = _pattern_from_argv(table, rest)
+        if pattern:
+            patterns.append(pattern)
+    return found, tuple(patterns)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,9 +633,19 @@ class Call:
     tool: str
     use_id: str | None
     path: str = ""
-    pattern: str = ""
+    #: Every search pattern this one call carried. A tuple because one shell
+    #: command can search twice (`grep a src | grep b`), and because a search
+    #: whose pattern could not be extracted carries none while still being a
+    #: search — see `is_search`.
+    patterns: tuple[str, ...] = ()
+    #: This call searched, whether or not a pattern came out of it.
+    is_search: bool = False
     windowed: bool = False
     sidechain: bool = False
+
+    @property
+    def symbol_search(self) -> bool:
+        return any(is_symbol_query(p) for p in self.patterns)
 
 
 @dataclass
@@ -390,6 +695,11 @@ def _search_pattern(inp: dict) -> str:
     return str(inp.get("pattern") or inp.get("query") or "")
 
 
+def _shell_command(inp: dict) -> str:
+    """The command text, under either key the two sources use."""
+    return str(inp.get("command") or inp.get("cmd") or "")
+
+
 def _call_from(tool: str, inp: dict, use_id: str | None,
                *, sidechain: bool) -> Call:
     """Normalize one tool call.
@@ -403,8 +713,14 @@ def _call_from(tool: str, inp: dict, use_id: str | None,
         return Call(tool=tool, use_id=use_id, path=_read_path(inp),
                     windowed=_windowed(inp), sidechain=sidechain)
     if tool in SYMBOL_QUERY_TOOLS:
-        return Call(tool=tool, use_id=use_id, pattern=_search_pattern(inp),
+        pattern = _search_pattern(inp)
+        return Call(tool=tool, use_id=use_id, is_search=True,
+                    patterns=(pattern,) if pattern else (),
                     sidechain=sidechain)
+    if tool in SHELL_TOOLS:
+        found, patterns = shell_search(_shell_command(inp))
+        return Call(tool=tool, use_id=use_id, is_search=found,
+                    patterns=patterns, sidechain=sidechain)
     return Call(tool=tool, use_id=use_id, sidechain=sidechain)
 
 
@@ -670,6 +986,35 @@ def _extension(path: str) -> str:
     return f".{ext.lower()}" if dot and ext and stem else "(none)"
 
 
+def search_census(corpus: Corpus) -> dict[str, int]:
+    """How much of a search channel this corpus actually has.
+
+    THE VERDICT IS NOT ALLOWED TO RUN WITHOUT THIS. `symbol_lookup` reaching 0
+    has two completely different causes — the agent never asked a symbol
+    question, or this source records no searches for the instrument to read —
+    and the class alone renders them identically. The first version of this
+    script had no census, so on the product's own telemetry it reported a
+    confident negative built on a signal that could not exist.
+
+    Three numbers, not one, because the middle one is the parser's own
+    coverage: a recognised search whose pattern could not be extracted is
+    counted as a search and not as a symbol one, so a gap in the option tables
+    shows up as a gap rather than as evidence about the agent.
+    """
+    searches = with_pattern = symbol = 0
+    for window in corpus.windows:
+        for call in window.calls:
+            if not call.is_search:
+                continue
+            searches += 1
+            if call.patterns:
+                with_pattern += 1
+            if call.symbol_search:
+                symbol += 1
+    return {"searches": searches, "searches_with_pattern": with_pattern,
+            "symbol_searches": symbol}
+
+
 def classify(corpus: Corpus, *, large_read_chars: int,
              lookback: int) -> list[ReadCall]:
     """Every read in the corpus, classified within its own context window."""
@@ -694,9 +1039,7 @@ def classify(corpus: Corpus, *, large_read_chars: int,
             # "just searched for a symbol", not "ever searched".
             start = max(0, index - lookback) if lookback else index
             symbol_lookup = symbol_served and any(
-                prior.tool in SYMBOL_QUERY_TOOLS
-                and is_symbol_query(prior.pattern)
-                for prior in calls[start:index]
+                prior.symbol_search for prior in calls[start:index]
             )
             whole_file = (symbol_served and not call.windowed
                           and chars is not None
@@ -901,6 +1244,12 @@ def render(report: dict) -> str:
         f"{total['reads']} read(s), {data['reads_without_result']} with no "
         "recorded result"
     )
+    census = report["search_census"]
+    out.append(
+        f"search channel: {census['searches']} search call(s), "
+        f"{census['searches_with_pattern']} with an extractable pattern, "
+        f"{census['symbol_searches']} symbol-shaped"
+    )
     out.append(
         f"thresholds: large read >= {report['large_read_chars']:,} chars, "
         f"lookback {report['lookback']} call(s), symbol answer estimated at "
@@ -942,12 +1291,18 @@ def render(report: dict) -> str:
     for reason in report["verdict"]["reasons"]:
         out.append(f"  {reason}")
     probes = report["robustness"]["probed"]
+
+    def probe_line(threshold: str) -> str:
+        probe = probes[threshold]
+        return (f"{int(threshold):,} chars gives {probe['decision']} on "
+                f"{probe['navigable_reads']} navigable read(s)")
+
+    ordered = sorted(probes, key=int)
     if report["robustness"]["fragile"]:
         out.append(
             "  CAUTION: this verdict is not robust to the large-read "
             "threshold. Re-deciding at "
-            + ", ".join(f"{int(t):,} chars gives {d}"
-                        for t, d in sorted(probes.items(), key=lambda kv: int(kv[0])))
+            + ", ".join(probe_line(t) for t in ordered)
             + ". The decision above is the one the pre-registered threshold "
               "gives, which stops the number being tuned to the answer -- it "
               "does not make the answer a property of the data. Do not close "
@@ -956,8 +1311,10 @@ def render(report: dict) -> str:
     elif probes:
         out.append(
             "  robustness: the same decision at "
-            + ", ".join(f"{int(t):,}" for t in sorted(probes, key=int))
-            + " chars, so it is not an artifact of where 'large' starts."
+            + ", ".join(probe_line(t) for t in ordered)
+            + ". A probe qualifying far fewer reads than the shipped "
+              "threshold could not have disagreed, so read its count before "
+              "reading its agreement as corroboration."
         )
     if classes["sidechain"]["reads"]:
         out.append(
@@ -966,13 +1323,43 @@ def render(report: dict) -> str:
             "subagent's result is re-read in its own context, whose remaining "
             "turns neither source records."
         )
+    # The three ways `symbol_lookup` reaches zero are three different facts,
+    # and the first version of this script printed the last of them for all
+    # three. An absent channel is a gap in the source or the parser; searches
+    # that yielded no pattern are a gap in the option tables; searches that
+    # were all text is the only one of the three that says anything about the
+    # agent. Rendering them identically is what let a confident negative be
+    # read off a signal that could not exist.
     if not classes["symbol_lookup"]["reads"]:
-        out.append(
-            "NOTE: no read followed a symbol-shaped search within the "
-            "lookback. Read that as 'this instrument saw none', not as 'the "
-            "agent never looked a symbol up': a symbol question answered "
-            "from memory leaves no search behind."
-        )
+        if not census["searches"]:
+            out.append(
+                "NOTE: this source recorded NO search calls at all, so "
+                "symbol_lookup could not have been anything but zero. That is "
+                "a gap in the source or in this instrument, never evidence "
+                "about the agent."
+            )
+        elif not census["searches_with_pattern"]:
+            out.append(
+                f"NOTE: {census['searches']} search call(s) were seen and a "
+                "pattern could be extracted from none of them, so "
+                "symbol_lookup is measuring this script's option tables "
+                "rather than the agent."
+            )
+        elif not census["symbol_searches"]:
+            out.append(
+                f"NOTE: {census['searches_with_pattern']} search pattern(s) "
+                "were read and none was symbol-shaped. Every search this "
+                "corpus records is a text search, which IS a fact about the "
+                "agent -- unlike a zero produced by an absent channel."
+            )
+        else:
+            out.append(
+                f"NOTE: {census['symbol_searches']} symbol-shaped search(es) "
+                "were seen, but no read followed one within the "
+                f"{report['lookback']}-call lookback. A symbol question "
+                "answered from memory, or answered by the search itself, "
+                "leaves no read behind."
+            )
     return "\n".join(out)
 
 
@@ -1027,8 +1414,8 @@ def robustness(corpus: Corpus, *, decision: str, large_read_chars: int,
     """Re-decide at half and double the large-read threshold.
 
     THIS EXISTS BECAUSE THE FIRST REAL RUN NEEDED IT. On the transcript
-    corpus the pre-registered 12,000-char threshold gives HALT at 10.4% / 13.7%
-    — and 6,000 gives PROCEED at 19.1% / 24.3%. Same data, same corpus, one
+    corpus the pre-registered 12,000-char threshold gives HALT at 11.2% / 14.6%
+    — and 6,000 gives PROCEED. Same data, same corpus, one
     constant, opposite decisions about whether this project builds a symbol
     server. A verdict that turns on a threshold rather than on the data has to
     say so out loud, or the pre-registration is decorative: it stops anyone
@@ -1039,8 +1426,16 @@ def robustness(corpus: Corpus, *, decision: str, large_read_chars: int,
     The decision vocabulary stays three-valued because a fragile HALT is still
     a HALT under the terms that were registered — it is just a HALT nobody
     should close the phase on without the authoritative population.
+
+    A PROBE CARRIES ITS QUALIFYING COUNT, and that number is what makes it
+    evidence or not. Raise the threshold far enough and almost no read clears
+    it — on the fleet database the doubled probe qualified 21 reads out of
+    35,557 — so that probe can only ever return HALT and agreeing with the
+    shipped decision tells a reader nothing. Printing the count is what stops
+    "the same decision at both probes" being read as corroboration when one
+    side of it was arithmetically incapable of disagreeing.
     """
-    probes: dict[str, str] = {}
+    probes: dict[str, dict] = {}
     for factor in _ROBUSTNESS_FACTORS:
         threshold = int(large_read_chars * factor)
         if threshold == large_read_chars:
@@ -1048,12 +1443,18 @@ def robustness(corpus: Corpus, *, decision: str, large_read_chars: int,
         data = aggregate(
             classify(corpus, large_read_chars=threshold, lookback=lookback),
             symbol_response_chars=symbol_response_chars)
-        probes[str(threshold)] = verdict(
-            data, corpus.sessions, min_reads=min_reads,
-            min_sessions=min_sessions)["decision"]
+        probes[str(threshold)] = {
+            "decision": verdict(data, corpus.sessions, min_reads=min_reads,
+                                min_sessions=min_sessions)["decision"],
+            "navigable_reads": data["classes"]["navigable"]["reads"],
+            "whole_file_reads": data["classes"]["whole_file"]["reads"],
+            "share_chars": data["share_chars"],
+            "share_weighted": data["share_weighted"],
+        }
     return {
         "probed": probes,
-        "fragile": any(other != decision for other in probes.values()),
+        "fragile": any(probe["decision"] != decision
+                       for probe in probes.values()),
     }
 
 
@@ -1066,6 +1467,7 @@ def collect(corpus: Corpus, *, large_read_chars: int, lookback: int,
     decision = verdict(data, corpus.sessions, min_reads=min_reads,
                        min_sessions=min_sessions)
     return {
+        "search_census": search_census(corpus),
         "source": corpus.source,
         "sessions": corpus.sessions,
         "windows": len(corpus.windows),
@@ -1143,6 +1545,23 @@ def main(argv: list[str] | None = None) -> int:
             f"no reads recorded in the {report['source']} population "
             f"({report['sessions']} session(s) scanned). An empty corpus is "
             "not a negative result and must not close this phase."
+        )
+
+    # Reads without searches is the shape that produced a wrong confident
+    # answer once already: both floors clear, the table renders, and the whole
+    # verdict rests on the size heuristic because the other signal was
+    # structurally unreachable. Refused for the same reason zero reads is.
+    if report["search_census"]["searches"] == 0:
+        raise NoSearchChannel(
+            f"the {report['source']} population records "
+            f"{report['measurement']['classes']['all']['reads']} read(s) and "
+            "no search calls, so symbol_lookup could only ever be 0 and the "
+            "verdict would rest entirely on the large-read heuristic. If this "
+            "is `--source events`, the coder searches through the shell and "
+            "`SHELL_TOOLS`/`_SEARCH_BINARIES` should have caught it; a "
+            "PowerShell-only or Select-String-only corpus is a known "
+            "unparsed channel. Fix the channel, do not read this as a "
+            "negative result."
         )
 
     if args.json:

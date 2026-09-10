@@ -6,14 +6,32 @@ this file is the check: every fixture below is a corpus whose correct verdict is
 fixed by construction, so an instrument that reads the data wrongly cannot come
 back with a comfortable answer.
 
-The one that matters most is ``non_code``. The first run of the script against
-this machine's real transcript corpus returned PROCEED at 27.6% addressable
-read mass — and it was wrong, because ``.md`` was the largest extension in that
-corpus by read mass and no definition/references/hover call answers a question
-about a README. With markdown, JSON, logs and lockfiles excluded the same
-corpus reads 10.4% raw / 13.7% weighted and the verdict is HALT. A bug in one
-constant flipped the phase gate, so the regression test for it is the first
-pair below.
+Three defects reached this file from real data rather than from reasoning, and
+each has a named test below.
+
+``non_code`` is the one that matters most. An early run against this machine's
+transcript corpus returned PROCEED at 27.6% addressable read mass — and it was
+wrong, because ``.md`` was the largest extension in that corpus by read mass and
+no definition/references/hover call answers a question about a README. With
+markdown, JSON, logs and lockfiles excluded, that same corpus dropped to 10.4%
+raw / 13.7% weighted and the verdict inverted to HALT. One constant flipped the
+phase gate, so the regression test for it is the first pair below: fixtures
+identical except for the file extension.
+
+**The search channel** is the one that mattered most on the population the
+phase is actually about. The script recognised searches only from the ``Grep``
+tool, and no_human's coder never emits it — measured on the fleet database,
+Grep/Glob/Search are 0 against 115,776 Bash calls, of which 50,459 contain
+grep/rg/ag/ack, because ``core/prompt_blocks.py`` tells the coder to "locate the
+relevant lines with `grep -n`". So ``symbol_lookup`` was STRUCTURALLY EMPTY on
+`--source events` while the report still rendered as though it had two signals,
+and the corpus cleared every floor, so the script decided anyway. Two tests pin
+the fix and two pin the refusal that now backs it up.
+
+**The headline denominator** had no test at all. Pointing ``share`` at the
+navigable class instead of total read mass turned a 12.1% HALT into an 88.2%
+PROCEED on the fleet database, and using ``chars`` for both units produced a
+319.8% "share", with every other test in this file still green.
 
 Expected counts are written as literals derived by hand from each fixture, not
 recomputed from the module under test: a test that asks the code what the
@@ -166,7 +184,15 @@ _BIG = 40_000
 _SMALL = 1_000
 
 
-def _session(root: Path, name: str, ext: str, *, big_last: bool = False):
+def _session(root: Path, name: str, ext: str, *, big_last: bool = False,
+             with_search: bool = False):
+    """One session of the fixed shape above.
+
+    ``with_search`` appends a trailing shell grep. It is OFF by default so the
+    hand-computed arithmetic in the comment stays valid (an extra call shifts
+    every read's turns_after), and ON for the tests that go through ``main``,
+    which refuses a corpus with no search channel at all.
+    """
     reads = [(f"{name}-big", {"file_path": f"/r/mod{ext}"}, _BIG)]
     reads += [(f"{name}-s{i}", {"file_path": f"/r/s{i}{ext}", "offset": 1,
                                 "limit": 20}, _SMALL) for i in range(9)]
@@ -176,14 +202,18 @@ def _session(root: Path, name: str, ext: str, *, big_last: bool = False):
     for use_id, inp, chars in reads:
         entries.append(_t_use("Read", use_id, **inp))
         entries.append(_t_result(use_id, "x" * chars))
+    if with_search:
+        entries.append(_t_use("Bash", f"{name}-grep",
+                              command="grep -rn parse_config src/"))
     return _transcript(root, name, entries)
 
 
 def _corpus_of(tmp_path: Path, *, sessions: int, ext: str,
-               big_last: bool = False):
+               big_last: bool = False, with_search: bool = False):
     root = tmp_path / "roots"
     for i in range(sessions):
-        _session(root, f"s{i}", ext, big_last=big_last)
+        _session(root, f"s{i}", ext, big_last=big_last,
+                 with_search=with_search)
     return nv.read_transcripts(nv._transcript_files((root,)))
 
 
@@ -317,6 +347,297 @@ def test_reads_with_no_recorded_result_do_not_shrink_the_denominator(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# The coder's real search channel: a grep inside a shell command              #
+# --------------------------------------------------------------------------- #
+
+# Every row is (command, is_a_search, extracted patterns). The pairs that
+# matter are the ones a single shared option table gets wrong:
+#   * `grep -r PATTERN .` vs `rg -r NEW PATTERN` -- `-r` takes no value in grep
+#     and IS `--replace` in ripgrep, so one table either eats grep's pattern or
+#     misreads ripgrep's.
+#   * `grep --color PATTERN` vs `--color=auto` -- an OPTIONAL-argument flag, so
+#     listing it as value-taking would eat the pattern in the commoner shape.
+#   * `grep -f patterns.txt` -- a real search whose pattern this script cannot
+#     see, which must count as a search and NOT as a symbol one.
+_SHELL_SEARCHES = [
+    ("grep -n 'def parse_config' src/", True, ("def parse_config",)),
+    ("grep -rn parse_config .", True, ("parse_config",)),
+    ("grep -r parse_config .", True, ("parse_config",)),
+    ("rg -r NEW parse_config", True, ("parse_config",)),
+    ("rg -l parse_config", True, ("parse_config",)),
+    ("rg -g '*.py' parse_config", True, ("parse_config",)),
+    ("rg -e 'class Foo' -t py", True, ("class Foo",)),
+    ("grep -A3 -B3 parse_config file.py", True, ("parse_config",)),
+    ("grep -m 5 parse_config file", True, ("parse_config",)),
+    ("grep -rn --include=*.py parse_config", True, ("parse_config",)),
+    ("grep -i -e foo -e bar file", True, ("foo",)),
+    ("grep --color parse_config file", True, ("parse_config",)),
+    ("grep --color=auto parse_config file", True, ("parse_config",)),
+    ("grep -- -weird file", True, ("-weird",)),
+    ("/usr/bin/grep -rn parse_config .", True, ("parse_config",)),
+    ("sudo grep -rn parse_config /etc", True, ("parse_config",)),
+    ("FOO=1 grep -rn parse_config .", True, ("parse_config",)),
+    ("cat x | grep parse_config", True, ("parse_config",)),
+    ("ls -la && grep -rn TODO .", True, ("TODO",)),
+    ("grep -rn 'def foo' a | grep bar", True, ("def foo", "bar")),
+    ("git grep -n parse_config", True, ("parse_config",)),
+    ("grep -f patterns.txt src/", True, ()),
+    ("git log --oneline", False, ()),
+    ("pytest -q", False, ()),
+    ("Select-String -Pattern parse_config", False, ()),
+    ("", False, ()),
+]
+
+
+@pytest.mark.parametrize("command,is_search,patterns", _SHELL_SEARCHES)
+def test_the_shell_search_extractor_reads_the_command_the_coder_wrote(
+        command, is_search, patterns):
+    assert nv.shell_search(command) == (is_search, patterns)
+
+
+def test_a_nested_quote_is_parsed_rather_than_fumbled():
+    """`grep -rn "unbalanced 'quote" .` is BALANCED -- the `'` sits inside the
+    `"` pair -- so `shlex` handles it and the pattern is one token.
+
+    Here as a guard against the fallback being reached too eagerly: the
+    cheap-looking test for "does this command have matched quotes" is a quote
+    count, and a quote count is wrong on exactly this shape.
+    """
+    assert nv.shell_search("grep -rn \"unbalanced 'quote\" .") == (
+        True, ("unbalanced 'quote",))
+
+
+@pytest.mark.parametrize("command", [
+    'grep -rn "def foo .',            # one unmatched double quote
+    "grep -rn 'parse_config",         # one unmatched single quote
+])
+def test_a_genuinely_unbalanced_command_is_a_search_with_no_pattern(command):
+    """Both halves matter, and they pull opposite ways.
+
+    Dropping the segment would shrink the search census silently, and the
+    census decides whether this script may return a verdict at all -- so the
+    fallback is a plain split. But a split is not a parse: whitespace-splitting
+    makes the pattern operand a fragment (`"def`), which is not the thing
+    searched for. So it is a SEARCH carrying NO pattern.
+    """
+    assert nv.shell_search(command) == (True, ())
+
+
+def test_a_fabricated_fragment_cannot_become_a_symbol_lookup():
+    """The case where the guard changes the SYMBOL verdict, not just a count.
+
+    `grep -rn parse_config " .` is unbalanced, so the fallback yields
+    `parse_config` as its operand -- identifier-shaped, and therefore a
+    symbol lookup -- off a command that was never parsed. Rejecting the
+    pattern from an untokenizable segment is what stops a parse failure
+    manufacturing evidence in the class the verdict leans on hardest.
+    """
+    assert nv.shell_search('grep -rn parse_config " .') == (True, ())
+
+    corpus = _one_window(
+        ("Bash", "g", {"command": 'grep -rn parse_config " .'}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    report = _report(corpus, min_reads=0, min_sessions=0)
+    assert report["measurement"]["classes"]["symbol_lookup"]["reads"] == 0
+    # A search, and honestly reported as one this script could not read.
+    assert report["search_census"] == {"searches": 1,
+                                       "searches_with_pattern": 0,
+                                       "symbol_searches": 0}
+
+
+def test_cleanliness_is_judged_per_segment_not_per_command():
+    """One bad segment must not discard a sibling that parsed fine.
+
+    `grep -rn "def foo bar" . | grep "x` has a clean first segment and an
+    unbalanced second. The whole command is unbalanced, so a command-level
+    check would throw away the pattern that was right there.
+    """
+    assert nv.shell_search('grep -rn "def foo bar" . | grep "x') == (
+        True, ("def foo bar",))
+
+
+def test_a_shell_grep_before_a_read_is_a_symbol_lookup():
+    """The whole point of the fix.
+
+    no_human's coder emits no Grep tool at all -- measured on the fleet
+    database, Grep/Glob/Search are 0 against 115,776 Bash calls, of which
+    50,459 contain grep/rg/ag/ack -- because `core/prompt_blocks.py` tells it
+    to "locate the relevant lines with `grep -n`". Reading only the Grep TOOL
+    made this class structurally unreachable on the product's own telemetry.
+    """
+    corpus = _one_window(
+        ("Bash", "g", {"command": "grep -rn 'def parse_config' src/"}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    report = _report(corpus, min_reads=0, min_sessions=0)
+
+    assert report["measurement"]["classes"]["symbol_lookup"]["reads"] == 1
+    assert report["search_census"] == {"searches": 1,
+                                       "searches_with_pattern": 1,
+                                       "symbol_searches": 1}
+
+
+def test_a_shell_grep_for_prose_is_a_search_but_not_a_symbol_one():
+    """The census separates "searched" from "searched for a symbol"."""
+    corpus = _one_window(
+        ("Bash", "g", {"command": "grep -rn 'TODO before the release' ."}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    report = _report(corpus, min_reads=0, min_sessions=0)
+
+    assert report["measurement"]["classes"]["symbol_lookup"]["reads"] == 0
+    assert report["search_census"] == {"searches": 1,
+                                       "searches_with_pattern": 1,
+                                       "symbol_searches": 0}
+
+
+def test_a_search_whose_pattern_cannot_be_read_is_still_a_search():
+    """`grep -f patterns.txt` searches; the patterns are in a file.
+
+    Counting it as "not a search" would let a gap in this script's option
+    tables render as "this corpus does not search", which is the false
+    negative the refusal below exists to prevent.
+    """
+    corpus = _one_window(
+        ("Bash", "g", {"command": "grep -f patterns.txt src/"}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    census = _report(corpus, min_reads=0, min_sessions=0)["search_census"]
+    assert census == {"searches": 1, "searches_with_pattern": 0,
+                      "symbol_searches": 0}
+
+
+def test_a_non_search_shell_command_is_not_counted(tmp_path):
+    corpus = _one_window(
+        ("Bash", "b", {"command": "pytest -q && git log --oneline"}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    assert _report(corpus, min_reads=0,
+                   min_sessions=0)["search_census"]["searches"] == 0
+
+
+def test_the_events_reader_finds_searches_in_bash_commands(tmp_path):
+    """End to end on the product's own event shape, which is what regressed.
+
+    `task_events` records the Bash command verbatim in `tool_input`, so the
+    search channel was always in the data -- the instrument just was not
+    reading it.
+    """
+    db = _events_db(tmp_path / "bashsearch.db", [
+        _use("Bash", "g", command="grep -rn 'def parse_config' src/"),
+        _result("g", 400),
+        _use("Read", "r", file_path="/r/mod.py"),
+        _result("r", 900),
+    ])
+    con = nv._connect(db)
+    try:
+        corpus = nv.read_events(con)
+    finally:
+        con.close()
+    report = _report(corpus, min_reads=0, min_sessions=0)
+
+    assert report["search_census"]["symbol_searches"] == 1
+    assert report["measurement"]["classes"]["symbol_lookup"]["reads"] == 1
+
+
+def test_a_corpus_with_reads_and_no_searches_is_refused_not_decided(tmp_path):
+    """The defect this fix exists for, pinned end to end.
+
+    Reads present, both floors cleared, and NO search channel -- so
+    symbol_lookup can only be 0 and the verdict would rest entirely on the
+    large-read heuristic while rendering as though it had two signals. That is
+    exactly what the first version of this script did on the fleet database.
+    An absent channel is a gap in the source or the parser, never evidence
+    about the agent, so it gets no verdict at all.
+    """
+    root = tmp_path / "roots"
+    for i in range(25):
+        _session(root, f"s{i}", ".py")          # no with_search
+    with pytest.raises(nv.NoSearchChannel) as excinfo:
+        nv.main(["--source", "transcripts", "--transcript-root", str(root)])
+
+    message = str(excinfo.value)
+    assert "FAIL (no search channel)" in message
+    # It must not be mistakable for the empty-corpus refusal, and it must not
+    # leak the verdict it declined to give.
+    assert "empty input set" not in message
+    for decision in ("HALT", "PROCEED", "INCONCLUSIVE"):
+        assert decision not in message
+
+
+def test_the_no_search_refusal_is_distinct_from_the_empty_one(tmp_path):
+    """Two different failures must not share an exception class.
+
+    A caller that catches one and not the other has to be able to tell "no
+    data" from "no search channel"; they call for different fixes.
+    """
+    assert not issubclass(nv.NoSearchChannel, nv.EmptyInputSet)
+    assert not issubclass(nv.EmptyInputSet, nv.NoSearchChannel)
+    assert issubclass(nv.NoSearchChannel, SystemExit)
+
+
+@pytest.mark.parametrize("command,expected", [
+    # No search calls at all: a gap in the source or the instrument.
+    (None, "recorded NO search calls at all"),
+    # Searched, but no pattern came out: a gap in the option tables.
+    ("grep -f patterns.txt src/", "a pattern could be extracted from none"),
+    # Searched, patterns read, all text: the only one that is a fact about
+    # the agent.
+    ("grep -rn 'TODO before the release' .", "none was symbol-shaped"),
+])
+def test_a_zero_symbol_lookup_says_which_of_its_causes_applies(
+        command, expected):
+    """Three different facts that all render `symbol_lookup 0`.
+
+    The first version printed the same NOTE for all three -- "a symbol
+    question answered from memory leaves no search behind" -- which on the
+    fleet database explained the zero exactly backwards: the real reason was
+    that the source recorded no search calls the instrument could read. A
+    reviewer cannot tell those apart from an identical line.
+    """
+    calls = [("Read", "r", {"file_path": "/r/mod.py"})]
+    if command is not None:
+        calls.insert(0, ("Bash", "g", {"command": command}))
+    corpus = _one_window(*calls)
+    corpus.sizes["r"] = (500, False)
+    rendered = nv.render(_report(corpus, min_reads=0, min_sessions=0))
+
+    assert rendered.count("NOTE:") == 1
+    assert expected in rendered
+
+
+def test_the_fourth_cause_of_a_zero_is_the_lookback_not_the_channel():
+    """A symbol-shaped search that no read followed inside the window."""
+    corpus = _one_window(
+        ("Bash", "g", {"command": "grep -rn parse_config src/"}),
+        ("Bash", "b1", {"command": "pytest -q"}),
+        ("Bash", "b2", {"command": "pytest -q"}),
+        ("Bash", "b3", {"command": "pytest -q"}),
+        ("Read", "r", {"file_path": "/r/mod.py"}),
+    )
+    corpus.sizes["r"] = (500, False)
+    rendered = nv.render(_report(corpus, min_reads=0, min_sessions=0))
+
+    assert "symbol-shaped search(es)" in rendered
+    assert "no read followed one within the 3-call lookback" in rendered
+
+
+def test_the_search_census_is_printed_even_when_it_is_healthy(tmp_path):
+    """"0 searches seen" and "0 of N were symbol-shaped" must not render the
+    same, which means the census has to be on the page unconditionally."""
+    rendered = nv.render(_report(
+        _corpus_of(tmp_path, sessions=25, ext=".py", with_search=True)))
+    assert "search channel: 25 search call(s), 25 with an extractable "\
+           "pattern, 25 symbol-shaped" in rendered
+
+
+# --------------------------------------------------------------------------- #
 # Is this Grep pattern a symbol query?                                        #
 # --------------------------------------------------------------------------- #
 
@@ -332,7 +653,10 @@ def test_reads_with_no_recorded_result_do_not_shrink_the_denominator(tmp_path):
     "async def resume_task",
     "parse_config(",
     r"def parse_config\(self",
-    "'parse_config'",
+    # A declaration keyword is what licenses the `:`/`=` tail split, so an
+    # annotated declaration still resolves to its name.
+    "const parseConfig: string",
+    "let parseConfig = 1",
 ])
 def test_symbol_shaped_patterns_are_recognised(pattern):
     assert nv.is_symbol_query(pattern) is True
@@ -358,6 +682,27 @@ def test_symbol_shaped_patterns_are_recognised(pattern):
     # Under-counting the strongest class biases the verdict toward HALT, which
     # is the safe direction here.
     "public static void main",
+    # ---- Measured false positives. Every row below was CLASSIFIED AS A -----
+    # ---- SYMBOL LOOKUP until the two rules in `is_symbol_query`'s      -----
+    # ---- docstring landed, found by reading what it accepted across    -----
+    # ---- 1,470 real search patterns rather than by reasoning about it. -----
+    #
+    # A search for a quoted string literal - a JSON key, not a definition.
+    "'parse_config'",
+    '"version"',
+    '"typescript"',
+    # Fragments left by the unbalanced-quote fallback in `_segment_argv`.
+    # A symbol's NAME never carries a quote, which is what disqualifies them.
+    '"Test',
+    '"^export',
+    "from '",
+    "'\"action",
+    # A key or attribute VALUE, which no definition call answers. These
+    # survived because the `=`/`:` tail split kept their left-hand side even
+    # with no declaration keyword in sight.
+    'kind="tool_result"',
+    "risk:",
+    "_ON = ",
 ])
 def test_text_searches_are_not_symbol_queries(pattern):
     assert nv.is_symbol_query(pattern) is False
@@ -592,6 +937,104 @@ def test_raising_the_symbol_answer_estimate_can_only_shrink_the_saving(tmp_path)
 
 
 # --------------------------------------------------------------------------- #
+# The headline denominator                                                    #
+# --------------------------------------------------------------------------- #
+
+def _denominator_corpus():
+    """One window whose every figure is hand-derivable, with real
+    non-navigable mass in it so the denominator choice actually shows.
+
+      idx 0  .py  40,000 chars, unwindowed, turns_after 2  -> navigable
+      idx 1  .md  10,000 chars, unwindowed, turns_after 1  -> non_code
+      idx 2  Bash (not a read, but it is a turn)
+
+      all         chars 40,000 + 10,000              =  50,000
+                  weighted 40,000x2 + 10,000x1       =  90,000
+      navigable   chars 40,000, weighted 80,000
+      addressable 40,000 - 2,000                     =  38,000 chars
+                  38,000 x 2                         =  76,000 weighted
+      share_chars     38,000 /  50,000 = 0.76
+      share_weighted  76,000 /  90,000 = 0.8444...
+    """
+    corpus = _one_window(
+        ("Read", "code", {"file_path": "/r/mod.py"}),
+        ("Read", "doc", {"file_path": "/r/README.md"}),
+        ("Bash", "b", {"command": "pytest -q"}),
+    )
+    corpus.sizes.update({"code": (40_000, False), "doc": (10_000, False)})
+    return corpus
+
+
+def test_the_share_denominator_is_total_read_mass():
+    """`total = classes["all"][unit]` had no test at all.
+
+    Pointing it at ``classes["navigable"]`` turns this fixture's 76.0% into
+    95.0% -- and on the fleet database turned a 12.1% HALT into an 88.2%
+    PROCEED -- while every other assertion in this file stays green, because
+    nothing else reads the share. Literals below are hand-derived in
+    `_denominator_corpus`, not recomputed from the module.
+    """
+    measurement = _report(_denominator_corpus(), min_reads=0,
+                          min_sessions=0)["measurement"]
+
+    assert measurement["classes"]["all"]["chars"] == 50_000
+    assert measurement["classes"]["all"]["weighted"] == 90_000
+    assert measurement["classes"]["navigable"]["chars"] == 40_000
+    assert measurement["classes"]["navigable"]["weighted"] == 80_000
+    assert measurement["addressable"] == {"chars": 38_000, "weighted": 76_000}
+
+    assert measurement["share_chars"] == pytest.approx(0.76)
+    assert measurement["share_weighted"] == pytest.approx(76_000 / 90_000)
+    # Named explicitly, because this is the mutant: the navigable class as the
+    # denominator reads as a far larger opportunity than the corpus holds.
+    assert measurement["share_chars"] != pytest.approx(38_000 / 40_000)
+    assert measurement["share_weighted"] != pytest.approx(76_000 / 80_000)
+
+
+def test_each_unit_divides_by_its_own_total():
+    """The second mutant: `chars` as the denominator for BOTH units.
+
+    That is not a small error -- weighted mass is larger than raw mass by a
+    factor of the window length, so the "share" it produces exceeded 100% on
+    the fleet database (319.8%). A share above 1.0 is arithmetically
+    impossible for a subset of the mass it divides, so it is also asserted
+    directly.
+    """
+    measurement = _report(_denominator_corpus(), min_reads=0,
+                          min_sessions=0)["measurement"]
+
+    assert measurement["share_weighted"] != pytest.approx(76_000 / 50_000)
+    assert measurement["share_chars"] != pytest.approx(38_000 / 90_000)
+    for unit in ("share_chars", "share_weighted"):
+        assert 0.0 <= measurement[unit] <= 1.0, unit
+
+
+def test_the_share_cannot_exceed_one_on_the_floor_clearing_fixtures(tmp_path):
+    """A property, over the fixtures whose verdicts this file already pins.
+
+    Addressable mass is a subset of read mass by construction (it is a
+    per-read clamp of a per-read quantity), so any share over 1.0 is a
+    denominator bug rather than a finding.
+    """
+    for ext in (".py", ".md"):
+        for big_last in (False, True):
+            measurement = _report(_corpus_of(
+                tmp_path / f"{ext}{big_last}", sessions=25, ext=ext,
+                big_last=big_last))["measurement"]
+            assert 0.0 <= measurement["share_chars"] <= 1.0
+            assert 0.0 <= measurement["share_weighted"] <= 1.0
+
+
+def test_a_zero_denominator_does_not_raise():
+    """Every read sized zero: the share is 0.0, not a ZeroDivisionError."""
+    corpus = _one_window(("Read", "r", {"file_path": "/r/mod.py"}))
+    corpus.sizes["r"] = (0, False)
+    measurement = _report(corpus, min_reads=0, min_sessions=0)["measurement"]
+    assert measurement["share_chars"] == 0.0
+    assert measurement["share_weighted"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
 # Is the verdict a property of the data, or of one constant?                   #
 # --------------------------------------------------------------------------- #
 
@@ -619,8 +1062,13 @@ def test_a_verdict_that_flips_at_half_the_threshold_says_so(tmp_path):
 
     assert report["verdict"]["decision"] == "HALT"
     assert report["robustness"]["fragile"] is True
-    assert report["robustness"]["probed"] == {"6000": "PROCEED",
-                                              "24000": "HALT"}
+    probed = report["robustness"]["probed"]
+    assert {t: p["decision"] for t, p in probed.items()} == {
+        "6000": "PROCEED", "24000": "HALT"}
+    # The qualifying count rides with every probe, so a probe that agreed only
+    # because almost nothing cleared its threshold is visible as such.
+    assert probed["6000"]["navigable_reads"] == 25
+    assert probed["24000"]["navigable_reads"] == 0
     caution = nv.render(report)
     assert "CAUTION: this verdict is not robust" in caution
     assert "6,000 chars gives PROCEED" in caution
@@ -636,7 +1084,9 @@ def test_a_verdict_that_holds_at_both_probes_says_that_too(tmp_path):
 
     assert report["verdict"]["decision"] == "HALT"
     assert report["robustness"]["fragile"] is False
-    assert set(report["robustness"]["probed"].values()) == {"HALT"}
+    probed = report["robustness"]["probed"]
+    assert {p["decision"] for p in probed.values()} == {"HALT"}
+    assert all(p["navigable_reads"] == 0 for p in probed.values())
     rendered = nv.render(report)
     assert "robustness: the same decision at" in rendered
     assert "CAUTION" not in rendered
@@ -1062,9 +1512,15 @@ def test_the_json_shape_does_not_change_with_the_data(tmp_path):
 
     assert set(report) == {"source", "sessions", "windows", "malformed",
                            "large_read_chars", "lookback", "measurement",
-                           "verdict", "robustness"}
+                           "verdict", "robustness", "search_census"}
+    assert set(report["search_census"]) == {
+        "searches", "searches_with_pattern", "symbol_searches"}
     assert set(report["verdict"]) == {"decision", "reasons"}
     assert set(report["robustness"]) == {"probed", "fragile"}
+    for probe in report["robustness"]["probed"].values():
+        assert set(probe) == {"decision", "navigable_reads",
+                              "whole_file_reads", "share_chars",
+                              "share_weighted"}
     assert set(measurement["classes"]) == set(nv._CLASSES)
     for name in nv._CLASSES:
         assert set(measurement["classes"][name]) == {"reads", "chars", "weighted"}
@@ -1130,7 +1586,7 @@ def test_main_prints_a_verdict_and_exits_zero_on_a_measured_corpus(
     """End to end through `main`, on the argv a reader would actually type."""
     root = tmp_path / "roots"
     for i in range(25):
-        _session(root, f"s{i}", ".py")
+        _session(root, f"s{i}", ".py", with_search=True)
 
     assert nv.main(["--source", "transcripts",
                     "--transcript-root", str(root)]) == 0
@@ -1140,7 +1596,7 @@ def test_main_prints_a_verdict_and_exits_zero_on_a_measured_corpus(
 def test_main_json_is_parseable_and_carries_the_verdict(tmp_path, capsys):
     root = tmp_path / "roots"
     for i in range(25):
-        _session(root, f"s{i}", ".md")
+        _session(root, f"s{i}", ".md", with_search=True)
 
     assert nv.main(["--source", "transcripts", "--transcript-root", str(root),
                     "--json"]) == 0
