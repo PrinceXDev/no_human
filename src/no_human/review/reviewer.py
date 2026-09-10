@@ -1012,10 +1012,16 @@ def _build_review_prompt(
     # tests` and `_flaky_on_rerun` run only in the post-review TESTING step
     # — classifying here was tried and sent back (429b471f/03267ead) because
     # it starved the flaky tiebreaker. Without this wording the reviewer
-    # graded a test that is red on every worktree for environmental reasons
-    # as a critical, diff-caused defect: 86b5bf3d round 3 and 70f5109f round
-    # 4 both failed on the `tests/test_guard.py` redness filed separately as
-    # 168cb43f, for tests neither coder touched nor could fix.
+    # graded a test that was red in the harness's own runs as a critical
+    # defect: 86b5bf3d rounds 3 and 4 both failed that way, for tests neither
+    # coder touched — and both graded it critical while saying the diff had
+    # not caused it (round 3: "Per the review rules I must grade this red
+    # run critical"), which is the whole problem. Those
+    # particular tests inherited the runner's environment instead of building
+    # the one they meant to exercise, and were fixed by pinning `env=`
+    # (8b85472d). The point here is not that case but the class: at THIS step
+    # the harness has not yet decided whether a failing id belongs to the
+    # diff, so the prompt must not order a critical verdict as if it had.
     failing_ids_section = ""
     if failing_test_ids:
         ids_line = ", ".join(failing_test_ids)

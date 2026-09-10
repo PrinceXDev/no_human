@@ -2426,18 +2426,15 @@ def test_installs_into_the_worktree_own_venv_are_allowed(tmp_path, monkeypatch):
 
     `env=` pinned explicitly (2026-09-09): this test used to pass no `env`,
     so `guard.evaluate` fell back to `os.environ` and the verdict depended on
-    the PATH of whatever process happened to run it. `uv pip install -e .`
-    contains a bare inner `pip`, which the guard resolves with
-    `shutil.which`; when the runner's PATH leads with a venv that both owns a
-    `pyvenv.cfg` and contains a `pip`, that venv became the install target, it
-    sat outside the fake `worktree` this test builds as `cwd`, and the command
-    was denied. Both conditions are needed: a `pyvenv.cfg` with no `pip` leaves
-    `shutil.which` empty and the guard allows and logs. `python -m venv` and
-    `uv venv --seed` produce a venv with `pip`; a plain `uv venv` does not,
-    which is why this reproduced in task worktrees and not in the checkouts it
-    was hunted in. The test now constructs the environment it
-    means to exercise instead of inheriting one, which is the only thing
-    this change decides.
+    the PATH of whatever process happened to run it — red under the PATH the
+    product's own worktrees get, green under the one the checkouts it was
+    hunted in get.
+    Whether a given PATH produces a denial is `agent/venv_install_guard.py`'s
+    to decide and is deliberately not restated here: successive attempts to
+    summarise it in this docstring were each falsified by a case the summary
+    had missed, so the module is left as the single source. What this test
+    now does is construct the environment it means to exercise instead of
+    inheriting one, which is the only thing this change decides.
 
     It deliberately does NOT settle whether the guard should treat a bare
     inner installer name as a write-target signal at all. An independent
@@ -2447,8 +2444,8 @@ def test_installs_into_the_worktree_own_venv_are_allowed(tmp_path, monkeypatch):
     the guard is narrower and measured: from the ROOT of a worktree whose
     ambient venv is its own, both `uv pip install -e .` and
     `pip install -e .` are allowed; from a SUBDIRECTORY of that same
-    worktree both are denied. That is filed as its own ticket (7f579176)
-    and the behaviour here is unchanged.
+    worktree both are denied. That is filed as 7f579176 and the behaviour
+    here is unchanged.
     """
     primary = _fake_primary_checkout(tmp_path)
     worktree = _fake_worktree(tmp_path)

@@ -387,16 +387,24 @@ FROZEN_FUNCTION_LINES = {
     # the scanner below.
     # 327 -> 342 (+15): follow-up to 4e0299ad — the section gave the reviewer
     # NO indication the ids were unattributed at review time, so a critical
-    # verdict was ordered unconditionally. 86b5bf3d round 3 and 70f5109f
-    # round 4 were both failed on `tests/test_guard.py`'s environmental
-    # redness (168cb43f) for tests neither coder touched. Reworded the
+    # verdict was ordered unconditionally. 86b5bf3d rounds 3 and 4 were both
+    # failed on `tests/test_guard.py`'s redness, for tests neither coder
+    # touched. Reworded the
     # comment above `failing_ids_section` and its text to say the harness
     # has NOT yet attributed the ids, a base-tree-red id is not this
     # change's defect, the post-review TESTING step decides, and "critical
     # severity" applies only when the diff plausibly explains the failure.
     # No classification, base checkout, or extra test run added at review
-    # time. Measured on this tree with the scanner below.
-    "review/reviewer.py:_build_review_prompt": 342,
+    # time.
+    # 341 -> 347 (+6): comment only. The wording above pointed at a task that
+    # is `failed` and called the `tests/test_guard.py` redness environmental.
+    # It was neither: those tests inherited the runner's PATH instead of
+    # building the environment they meant to exercise, and were fixed by
+    # pinning `env=` (8b85472d). The frozen 342 was itself stale — the base
+    # measures 341, and a frozen value ABOVE the measurement passes silently,
+    # which is why it went unnoticed. Measured on this tree with the scanner
+    # below.
+    "review/reviewer.py:_build_review_prompt": 347,
 }
 
 # 5 functions with estimated cyclomatic complexity > 60.
@@ -1631,7 +1639,11 @@ FROZEN_FILE_LINES = {
     # result by the scanner's own metric, never summed: an earlier revision of
     # this comment recorded 3063 from an older base and was left behind when
     # main moved, which is exactly the drift this ledger exists to prevent.
-    "review/reviewer.py": 3078,
+    # 3078 -> 3084 (+6): the same comment-only rewrite as the
+    # `_build_review_prompt` entry above — nothing executable changed, and
+    # the whole rewritten block lies inside that function, so the file and
+    # the function move by the same amount.
+    "review/reviewer.py": 3084,
     # 2706 -> 2711 (+5): pre-existing red on main at 03b262d23 (e922e9b4's
     # landing, change-scoped tests missed the ratchet) — repaired, measured,
     # on this merge; same cause as the two function-level wake.py bumps above.

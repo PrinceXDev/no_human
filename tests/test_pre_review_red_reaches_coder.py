@@ -455,9 +455,11 @@ async def test_build_review_prompt_carries_fixed_failing_ids_section(bare_repo, 
     # is not this change's defect, that the post-review TESTING step is
     # what decides, and that "critical severity" is conditioned on the diff
     # plausibly explaining the failure rather than unconditional. Incidents:
-    # 86b5bf3d round 3 and 70f5109f round 4 were both failed by the reviewer
-    # on the environmental `tests/test_guard.py` redness (168cb43f) despite
-    # neither coder touching those tests.
+    # 86b5bf3d rounds 3 and 4 were both failed by the reviewer on the
+    # `tests/test_guard.py` redness — those tests inherited the runner's
+    # environment instead of building the one they meant to exercise, fixed
+    # in 8b85472d — despite neither coder touching them, and with both
+    # reviewers stating the diff had not caused the failures.
     assert "has NOT yet attributed" in prompt
     assert "base tree" in prompt
     assert "post-review testing step" in prompt
