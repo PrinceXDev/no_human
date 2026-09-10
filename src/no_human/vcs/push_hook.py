@@ -9,6 +9,7 @@ protected branch name. It is lexical, and lexical analysis cannot resolve shell
 expansion: ``git push origin $(echo main)``, ``B=main; git push origin $B`` and
 ``git push origin `echo main` `` all reach the same ref while carrying no token
 that reads as ``main``. The coder runs with ``permission_mode="bypassPermissions"``
+by default, and Bash is pre-approved under the alternative ``acceptEdits`` mode
 (``agent/claude_backend.py``), so on the Bash path that guard is the only gate —
 the product's own :meth:`GitRepo.push` raises ``ProtectedBranch``, but an agent
 shelling out to ``git push`` never reaches that code.

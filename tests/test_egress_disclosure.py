@@ -18,10 +18,11 @@ WHAT IT CANNOT SEE — the same honesty ``docs/security.md`` §7 states about
 itself, because a guard that oversells its coverage is the defect it is meant
 to prevent:
 
-  * **The coder agent's own Bash.** The backend runs with
-    ``permission_mode="bypassPermissions"`` and no tool allowlist, so a
-    ``curl``, a ``pip install``, or a test suite that calls a staging API leaves
-    the machine without passing through any code this test parses. That traffic
+  * **The coder agent's own Bash.** The backend runs
+    ``permission_mode="bypassPermissions"`` by default, and its one alternative
+    (``llm.permission_mode: acceptEdits``) pre-approves ``Bash`` — so under
+    either, a ``curl``, a ``pip install``, or a test suite that calls a staging
+    API leaves the machine without passing through any code this test parses. That traffic
     is unbounded and no static check can bound it.
   * **A dependency's own telemetry.** ``httpx``, the Claude Agent SDK, Electron,
     Playwright and everything in ``uv.lock`` can open sockets of their own. This

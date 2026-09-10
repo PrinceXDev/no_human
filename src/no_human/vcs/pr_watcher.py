@@ -356,7 +356,9 @@ def is_agent_comment(body: str | None) -> bool:
     `upsert_agent_comment`, the orchestrator's verification receipts, and
     `comment_poster._stamped` (which keeps it there when it inserts a location
     prefix). A marker anywhere else came from a human's keyboard. "In-repo" is
-    the real bound: no tool allowlist restricts the coder/reviewer agent's Bash,
+    the real bound: nothing restricts the coder/reviewer agent's Bash — it is
+    approved outright under the default permission mode and pre-approved under
+    the alternative one (`llm.permission_mode`), so this holds either way, and
     so an agent could `gh pr comment` an unmarked body that reads as human —
     identically so under the previous per-line anchor, hence a pre-existing
     residual of the unrestricted tool, not of this predicate.

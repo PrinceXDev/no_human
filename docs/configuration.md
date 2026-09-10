@@ -415,6 +415,39 @@ exception, for friends/commercial installs that pay Anthropic directly with
 4. No OAuth token is exported into the process env in this mode.
 5. The run is attributed to the `api_key` profile for cost/audit tracking.
 
+### `llm.permission_mode` — how the agent session answers permission prompts
+
+```yaml
+llm:
+  permission_mode: bypassPermissions   # default
+```
+
+| value | meaning |
+|---|---|
+| `bypassPermissions` (default) | The CLI approves every tool call. no_human's own PreToolUse guard is the safety boundary, not the CLI prompt. Unchanged for every existing install. |
+| `acceptEdits` | The CLI auto-approves file edits and pre-approves `Bash`. Anything else that would prompt is refused instead of run. |
+
+Set `acceptEdits` when `bypassPermissions` is **unavailable**. An organisation
+can disable that mode centrally, and the CLI then denies every mutating tool
+call while the attempt spends its whole budget producing nothing — a failure
+that looks like a confused agent rather than a policy. The tell is a denial
+naming the session's own working directory as the allowed one.
+
+Two limits worth knowing before you set it:
+
+- **It reaches the coder and the reviewer only.** Other sessions
+  (`nh docs generate`, the eval harnesses, the intake and grill sessions,
+  `nh doctor`'s probe) construct their backend directly and keep
+  `bypassPermissions`, so on a policy-bound install those still fail. The task
+  loop itself is not restored in full either: the researcher subagent handed to
+  every coder attempt hardcodes the mode too, so on such an install the coder
+  works and its researcher's Bash is still refused.
+- **It is validated at first backend construction, not when the config
+  loads.** A misspelling raises `AuthError` naming both legal values — but on
+  the first run, not at `nh doctor` time. Spelling is case-sensitive, and an
+  empty value (`permission_mode:` with nothing after it, or `null`) is an
+  error rather than a silent default.
+
 ### `llm.codex_auth_mode` — two modes for the `codex` coder backend
 
 Only consulted when `worker.backend` (or a task's `--backend`) is `codex`.

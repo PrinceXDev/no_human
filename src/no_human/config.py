@@ -146,6 +146,18 @@ CODEX_ALTERNATE_ROUTING_VARS = (
 # an unrecognised value — see `codex_auth_mode()` below.
 CODEX_AUTH_MODES = ("api_key", "subscription")
 
+# The permission modes an Agent SDK session may run under. `bypassPermissions`
+# is the default and the one the product was built around: the CLI approves
+# every tool by itself and no_human's own PreToolUse guard (`agent/guard.py`)
+# is the safety boundary. `acceptEdits` exists because that mode is not always
+# available — an organisation can disable it outright, and the CLI then denies
+# every mutating call with "you haven't granted it yet" while the run burns its
+# whole budget producing nothing (measured 2026-09-10: seven attempts, zero
+# file changes). Under `acceptEdits` the CLI auto-approves Write/Edit and never
+# prompts for the read-only tools, so the session needs an allowlist for the
+# one class that still stops it; `agent/claude_backend.py` supplies it.
+PERMISSION_MODES = ("bypassPermissions", "acceptEdits")
+
 # The alternate name some Codex CLI builds read for the OpenAI API key.
 # no_human never authenticates with it — it is named here only so
 # subscription mode can scrub it from the child env if an operator's shell
@@ -647,6 +659,36 @@ def codex_auth_mode(data: dict[str, Any]) -> str:
         raise AuthError(
             f"llm.codex_auth_mode is {raw!r}; it must be one of "
             f"{CODEX_AUTH_MODES!r}."
+        )
+    return value
+
+
+def permission_mode(data: dict[str, Any]) -> str:
+    """Read ``llm.permission_mode`` from a config dict; default
+    ``"bypassPermissions"``.
+
+    Fail-loud on an unrecognised value for the same reason
+    :func:`codex_auth_mode` is: the failure this key guards against is silent.
+    A typo would fall back to the default, the CLI would deny every mutating
+    tool call on an installation whose organisation forbids that mode, and the
+    operator would see a run that spends a full budget and writes nothing —
+    which is the exact symptom this key exists to cure.
+    """
+    llm = ((data or {}).get("llm") or {})
+    # ABSENT means "unset, use the default". PRESENT-BUT-EMPTY does not:
+    # `permission_mode:` with nothing after it, or `permission_mode: null`,
+    # is an operator who meant to set this and did not. `or <default>` would
+    # swallow "", None, False and 0 alike and hand back the default silently
+    # — the exact silent-fallback shape this key exists to prevent, since the
+    # default is the mode that gets denied on a policy-bound install.
+    if "permission_mode" not in llm:
+        return "bypassPermissions"
+    value = str(llm["permission_mode"] if llm["permission_mode"] is not None
+                else "").strip()
+    if value not in PERMISSION_MODES:
+        raise AuthError(
+            f"llm.permission_mode is {llm['permission_mode']!r}; it must be "
+            f"one of {PERMISSION_MODES!r} (spelling is case-sensitive)."
         )
     return value
 
@@ -1467,6 +1509,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # hint, never a verdict. It is never the implementer, planner, reviewer
         # or supervisor — those four tiers are fixed above.
         "utility_model": "claude-haiku-4-5",
+        # How the Agent SDK session answers its own permission prompts.
+        # "bypassPermissions" (the default, and unchanged for every existing
+        # install) approves every tool call; no_human's PreToolUse guard is
+        # the safety boundary, not the CLI's prompt. Set "acceptEdits" when
+        # that mode is unavailable — an organisation can disable it, and the
+        # CLI then denies every mutating call while the run spends its whole
+        # budget writing nothing. See PERMISSION_MODES.
+        "permission_mode": "bypassPermissions",
         # --- OpenAI Codex backend (only read when worker.backend == "codex") ---
         # Which of the two sanctioned Codex sign-ins pays for a run — see the
         # long comment above CODEX_API_KEY_VAR. Default "api_key" so no
